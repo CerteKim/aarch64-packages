@@ -6,9 +6,9 @@ ALL_kver="/boot/vmlinuz-%PKGBASE%"
 PRESETS=('default' 'fallback')
 
 #default_config="/etc/mkinitcpio.conf"
-default_image="/boot/initramfs-linux-surface.img"
+default_image="/boot/initramfs-linux-mibook.img"
 #default_options=""
 
 #fallback_config="/etc/mkinitcpio.conf"
-#fallback_image="/boot/initramfs-linux-surface-fallback.img"
+#fallback_image="/boot/initramfs-linux-mibook-fallback.img"
 #fallback_options="-S autodetect"
