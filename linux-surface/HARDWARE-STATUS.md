@@ -318,29 +318,38 @@ which takes the registry from 47 to 58 files, adding `sns_rotv_platform`,
 motion_detect}` bindings. The SSC reads the registry when the SLPI starts, so
 this needs a reboot rather than just a daemon restart.
 
-**That was necessary but not sufficient.** With those entries installed,
-`HasAccelerometer` is still false and `monitor-sensor` still reports "No
-accelerometer" (the ALS continues to work). The reason is inside
-`sns_rotv.json` itself: its only section is `sns_rotv_platform`, which is a
-*config* group — there is no `rotv` **sensor** definition anywhere in the
-vendor configs, so the SSC has nothing of that data type to report.
+### The actual cause: an incomplete udev rule upstream
 
-So iio-sensor-proxy 3.9's SSC accelerometer driver wants a fused rotation
-vector this device's firmware does not expose. Three ways forward, in the
-order I would try them:
+The `rotv` trail was a red herring. `rotv` does not appear anywhere in
+iio-sensor-proxy's source — that message came from **libssc**, invoked by the
+*compass* driver, not the accelerometer one.
 
-1. patch iio-sensor-proxy's SSC accelerometer driver to discover `accel`
-   instead of `rotv` — it already has its own orientation logic for the IIO
-   backend, but note that orientation would then depend on the mount matrix,
-   which the vendor ships as all zeros and we would have to work out
-   empirically;
-2. search the Windows driver store for a device-orientation or fusion sensor
-   definition (`sns_device_orient.json` exists there but is not in
-   `config_list.txt` and was never evaluated);
-3. accept ambient light and proximity only — both work today.
+The real gate is a udev property. Every SSC driver refuses to engage unless
+`IIO_SENSOR_PROXY_TYPE` contains its own string:
 
-Install staged at `~/qcom-slpi/install.sh` (hexagonrpcd, the configs, the
-registry, a systemd override passing `-R /usr/share/qcom/sc8180x/XIAOMI/BOOK124`).
+    drv-ssc-accel.c      "ssc-accel"
+    drv-ssc-light.c      "ssc-light"
+    drv-ssc-proximity.c  "ssc-proximity"
+    drv-ssc-compass.c    "ssc-compass"
+
+and that property is set by `/usr/lib/udev/rules.d/80-iio-sensor-proxy.rules`:
+
+    SUBSYSTEM=="misc", KERNEL=="fastrpc-sdsp*", ENV{IIO_SENSOR_PROXY_TYPE}+="ssc-light ssc-compass"
+
+Only light and compass. So the ALS worked while the accelerometer driver never
+ran at all — `udevadm info /dev/fastrpc-sdsp` shows exactly
+`IIO_SENSOR_PROXY_TYPE=ssc-light ssc-compass`. The compass entry is what
+produced the `No 'rotv' sensor available` line, because libssc's compass
+support looks for a rotation vector this firmware does not expose.
+
+The fix is a rule of our own in `/etc/udev/rules.d/`, staged at
+`~/qcom-slpi/udev/91-fastrpc-sensors.rules`:
+
+    SUBSYSTEM=="misc", KERNEL=="fastrpc-sdsp*", ENV{IIO_SENSOR_PROXY_TYPE}+="ssc-accel ssc-proximity"
+
+Both sensors are known good on this machine (`icm4x6xx` accel, `stk3a5x`
+proximity), so this is a genuine gap in the upstream rule rather than
+something board-specific.
 
 ## Not achievable with reasonable effort
 
