@@ -957,19 +957,31 @@ hardware is IRIS1), so the entry is a probe vehicle only: its only purpose is
 to find out whether the block is where the sm8250/sc7180 layout suggests and
 what the probe reports.
 
-The next step, if this is ever picked up again, is not the venus driver but:
+The PoC has since been moved **to the iris driver**, which is the correct one
+for IRIS1:
 
-1. a `sc8180x_data` entry in `iris_platform_sm8250.c`-style code: Gen1 HFI
-   (`iris_hfi_gen1_*`), `vpu_ops = &iris_vpu2_ops`, the videocc clock names
-   already in this device tree, `fwname = "qcom/vpu-1.0/venus.mbn"`;
-2. `CONFIG_VIDEO_QCOM_IRIS=m` (it is off today) and the matching compatible
-   in the device tree;
-3. firmware: the Windows `qcvss8180.mbn` is signed for the Windows PIL path
+* `iris_platform_sm8250.c` gains `sc8180x_data` (Gen1 HFI, `iris_vpu2_ops`,
+  SM8250 tables, `fwname = "qcom/vpu-1.0/venus.mbn"`, `pas_id = IRIS_PAS_ID`);
+* `iris_probe.c` matches `qcom,sc8180x-venus`, and `sc8180x.dtsi` grew an
+  `operating-points-v2` table of its own (the iris driver calls
+  `devm_pm_opp_of_add_table()`);
+* `CONFIG_VIDEO_QCOM_IRIS=m` is set and `CONFIG_VIDEO_QCOM_VENUS` is turned
+  off in `xiaomi-only.config`: `iris/Makefile` only compiles
+  `iris_platform_sm8250.o` when venus is *not* selected, and no sc8180x board
+  uses the venus driver.
+
+What is still missing before a decoder can work:
+
+1. firmware: the Windows `qcvss8180.mbn` is signed for the Windows PIL path
    and is not a drop-in for `linux-firmware`; a matching IRIS1 firmware for
-   SC8180X has to be sourced from a vendor/Android image.
-
-None of that is a one-evening job, and even then userspace has no VA-API
-driver for this VPU.
+   SC8180X has to be sourced from a vendor/Android image (none of
+   `vpu-1.0/venus.mbn`, `vpu-2.0/venus.mbn`, `venus-5.4/venus.mbn` carries an
+   `IR.1.x` version string);
+2. verification of the physical address space id and the secure context bank
+   for this SoC (both copied from SM8250 for now);
+3. userspace: there is no VA-API driver for this VPU, so even a working
+   `/dev/video0` would only be usable through a V4L2 stateful decoder path
+   (for example ffmpeg's `v4l2` hwaccel), not through the browser stack.
 
 ## Build note
 
