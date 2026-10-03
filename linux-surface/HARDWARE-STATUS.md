@@ -318,6 +318,27 @@ which takes the registry from 47 to 58 files, adding `sns_rotv_platform`,
 motion_detect}` bindings. The SSC reads the registry when the SLPI starts, so
 this needs a reboot rather than just a daemon restart.
 
+**That was necessary but not sufficient.** With those entries installed,
+`HasAccelerometer` is still false and `monitor-sensor` still reports "No
+accelerometer" (the ALS continues to work). The reason is inside
+`sns_rotv.json` itself: its only section is `sns_rotv_platform`, which is a
+*config* group — there is no `rotv` **sensor** definition anywhere in the
+vendor configs, so the SSC has nothing of that data type to report.
+
+So iio-sensor-proxy 3.9's SSC accelerometer driver wants a fused rotation
+vector this device's firmware does not expose. Three ways forward, in the
+order I would try them:
+
+1. patch iio-sensor-proxy's SSC accelerometer driver to discover `accel`
+   instead of `rotv` — it already has its own orientation logic for the IIO
+   backend, but note that orientation would then depend on the mount matrix,
+   which the vendor ships as all zeros and we would have to work out
+   empirically;
+2. search the Windows driver store for a device-orientation or fusion sensor
+   definition (`sns_device_orient.json` exists there but is not in
+   `config_list.txt` and was never evaluated);
+3. accept ambient light and proximity only — both work today.
+
 Install staged at `~/qcom-slpi/install.sh` (hexagonrpcd, the configs, the
 registry, a systemd override passing `-R /usr/share/qcom/sc8180x/XIAOMI/BOOK124`).
 
