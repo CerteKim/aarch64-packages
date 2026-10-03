@@ -13,6 +13,7 @@ set -euo pipefail
 
 KSRC="${1:-/home/certe/aarch64-packages/linux-surface/src/kernel}"
 FALLBACK="${2:-/home/certe/panel-fallback-single-dsi}"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KVER="$(make -s -C "$KSRC" ARCH=arm64 kernelrelease)"
 MODDIR="/usr/lib/modules/${KVER}"
 BOOT_DTB_DIR="/boot/dtb/linux-mibook/qcom"
@@ -55,9 +56,13 @@ rm -f /boot/initramfs-linux-mibook.img
 mv "$NEW_INITRAMFS" /boot/initramfs-linux-mibook.img
 chmod 644 /boot/initramfs-linux-mibook.img
 
-echo "==> installing the dual-DSI DTB (both GRUB-referenced paths)"
-install -Dm644 "$KSRC/arch/arm64/boot/dts/qcom/${DTB}" "$BOOT_DTB_DIR/${DTB}"
-install -Dm644 "$KSRC/arch/arm64/boot/dts/qcom/${DTB}" "$BOOT_DTB_DIR/sc8180x-xiaomi-book-12.4-oc.dtb"
+echo "==> installing the DTB (both GRUB-referenced paths)"
+# The single-link variant is the one that renders correctly; use
+# ./set-panel-link-mode.sh dual to switch the DTB afterwards.
+install -Dm644 "$REPO/panel-dtb/sc8180x-xiaomi-book-12.4.single-link.dtb" \
+    "$BOOT_DTB_DIR/${DTB}"
+install -Dm644 "$REPO/panel-dtb/sc8180x-xiaomi-book-12.4.single-link.dtb" \
+    "$BOOT_DTB_DIR/sc8180x-xiaomi-book-12.4-oc.dtb"
 
 echo
 echo "Done."
