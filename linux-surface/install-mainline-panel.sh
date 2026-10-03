@@ -13,6 +13,11 @@ set -euo pipefail
 
 KSRC="${1:-/home/certe/aarch64-packages/linux-surface/src/kernel}"
 FALLBACK="${2:-/home/certe/panel-fallback-single-dsi}"
+# With --no-modules the installer only touches the kernel image, the DTBs and
+# the initramfs, which is what you want after pacman -U installed the modules
+# (installing them again would put them outside pacman's database).
+INSTALL_MODULES=1
+[ "${1:-}" = "--no-modules" ] && { INSTALL_MODULES=0; KSRC="/home/certe/aarch64-packages/linux-surface/src/kernel"; shift; }
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KVER="$(make -s -C "$KSRC" ARCH=arm64 kernelrelease)"
 MODDIR="/usr/lib/modules/${KVER}"
@@ -38,8 +43,12 @@ for f in "$DTB" "sc8180x-xiaomi-book-12.4-oc.dtb"; do
     echo "    saved $f"
 done
 
-echo "==> installing kernel modules into ${MODDIR}"
-make -C "$KSRC" ARCH=arm64 INSTALL_MOD_PATH=/ INSTALL_MOD_STRIP=1 modules_install >/dev/null
+if [ "$INSTALL_MODULES" = 1 ]; then
+    echo "==> installing kernel modules into ${MODDIR}"
+    make -C "$KSRC" ARCH=arm64 INSTALL_MOD_PATH=/ INSTALL_MOD_STRIP=1 modules_install >/dev/null
+else
+    echo "==> skipping modules (--no-modules)"
+fi
 
 echo "==> installing kernel image"
 install -Dm644 "$KSRC/arch/arm64/boot/Image" /boot/vmlinuz-linux-mibook

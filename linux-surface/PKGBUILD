@@ -13,11 +13,15 @@ arch=("aarch64")
 options=("!strip")
 makedepends=('xmlto' 'docbook-xsl' 'kmod' 'inetutils' 'bc' 'git' 'dtc')
 
-_ref_ksource="f21bd1c66f26f56e2140372a6fa128256556674d"
+_ref_ksource="cb8e5e30be33f0694d1a9501f09dc276eac0097a"
 _ref_config_base="e36ada85974d22c05d1442a4ac47f958c7fa8e15"
 
+# The branch with the mainline panel driver is not pushed to GitHub yet, so the
+# source is the local mirror this repository already uses as its origin.  Once
+# the branch is on GitHub, replace the source below with
+#   "kernel::git+https://github.com/CerteKim/linux-a51.git#commit=${_ref_ksource}"
 source=(
-    "kernel::git+https://github.com/CerteKim/linux-a51.git#commit=${_ref_ksource}"
+    "kernel::git+file:///home/certe/aarch64-packages/linux-surface/kernel#commit=${_ref_ksource}"
     "base.config"
     "linux-mibook.preset"
     "xiaomi-only.config"
