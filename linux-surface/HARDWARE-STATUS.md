@@ -351,6 +351,24 @@ Both sensors are known good on this machine (`icm4x6xx` accel, `stk3a5x`
 proximity), so this is a genuine gap in the upstream rule rather than
 something board-specific.
 
+Confirmed on hardware: with the extra rule, `udevadm info /dev/fastrpc-sdsp`
+shows `ssc-light ssc-compass ssc-accel ssc-proximity`, and
+`iio-sensor-proxy` then reports
+
+    HasAccelerometer   b true
+    HasAmbientLight    b true
+    HasProximity       b true
+
+with the journal showing the accelerometer discovered as `data-type: accel`.
+Note the mount matrix is the identity - libssc substitutes identity because the
+vendor ships zeros, and iio-sensor-proxy independently falls back to identity
+too, so the two agree.
+
+The compass remains unavailable (`No 'rotv' sensor available`), which is real:
+libssc's compass support wants a rotation vector this firmware does not
+expose. iio-sensor-proxy has no `HasCompass` property at all, so it is
+cosmetic.
+
 ## Not achievable with reasonable effort
 
 | Subsystem | Why |
