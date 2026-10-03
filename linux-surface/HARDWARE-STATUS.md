@@ -9,7 +9,7 @@ Board: `xiaomi,book-12.4` / `TM2133`, BIOS `XM28C2B0P16`, Qualcomm SC8180X
 |---|---|
 | Display | CSOT PNC357DB1-4 panel via Himax HX83121A, msm_dpu + DSI, pmc8180c WLED backlight |
 | GPU | Adreno 680 (`adreno`, `msm`), ZAP shader `qcom/XIAOMI/BOOK124/qcdxkmsuc8180.mbn` |
-| Wi-Fi | WCN3990 (`ath10k_snoc`), fw `WLAN.HL.3.2.0.c8-…`. Random MAC each boot; `regulatory.db` missing |
+| Wi-Fi | WCN3990 (`ath10k_snoc`), fw `WLAN.HL.3.2.0.c8-…`. Random MAC each boot (`regulatory.db` now installed) |
 | NVMe | PCIe2 x2 lanes |
 | microSD | `sdhc_2` |
 | USB | 3x DWC3 + UCSI/pmic-glink, 2x USB-C, Pericom PI3USB102 SBU muxes |
@@ -152,6 +152,61 @@ Everything downstream of the codec was already succeeding.
 `wcd934x` and `wsa881x` sequences plus the sc8180x-mainline sm8150 profile,
 so a proper UCM profile can be assembled from them later.
 
+## Microphones — there are none on the codec
+
+Capture works end to end (codec ADC → SLIM TX → ADSP ADM → MultiMedia2 →
+ALSA): tying off `AIF1_CAP Mixer SLIM TX0` collapses the stream to the DSP
+idle pattern, so the data really does come from the codec. But nothing that
+reaches the WCD9340's ADC responds to sound.
+
+Measured with the speaker muted, a quiet baseline followed by tapping on the
+tablet and talking (`./xiaomi-book-12.4-mic-tap-test.sh`, "lift" = loud-window
+mean over the loudest quiet window):
+
+| Input | lift |
+|---|---|
+| AMIC1 (ADC1) | 0.96x |
+| AMIC2 (ADC2) | 0.98x |
+| AMIC3 (ADC3) | 1.25x |
+| AMIC4 (ADC4) | 0.81x |
+| DMIC0…DMIC5 | no data at all |
+
+That matches the hardware. Xiaomi's own spec sheet lists the audio as
+"Dual speakers, 3.5mm headphone jack" and no microphone anywhere; `arecord -l`
+shows the WCD9340 capture PCM as the only capture device on the system, and
+the keyboard cover is a plain composite device with no USB audio. The codec
+does register a `Headset Mic Jack` / `Headset Mic Switch`, and the machine
+driver has jack pins for `Headset Mic`, so the only microphone on this
+machine is the one on the 3.5 mm headset.
+
+Consequence: the `AMIC2`/`MIC BIAS2` routing inherited from the Yoga C630 is
+the headset-mic wiring and is probably right as it stands. Capture should
+work with a headset that has a microphone plugged in; there is no built-in
+microphone to fix.
+
+### Traps found while chasing this
+
+* **Speaker-pulse tests are useless on this machine.** Electrical crosstalk
+  out of the playback path makes AMIC1, AMIC2 and AMIC3 all "respond" to a
+  tone. Mute the speaker and use a real acoustic source instead.
+* **Capture only delivers data at `S24_LE`.** `arecord -D hw:0,1 -f S16_LE`
+  reports success and returns pure silence, while `-f S24_LE` works. The
+  machine driver's BE fixup pins the capture backend to `S16_LE` while the
+  front end runs `S24_LE`; anything asking for S16 gets nothing.
+* **`ADC MUX0` → `ZERO` wedges the TX path.** Afterwards captures return the
+  DSP idle pattern (3 distinct sample values) and only recover later on their
+  own. Switch `AMIC MUX0` / `DMIC MUX0` straight between inputs instead.
+* The `missing qcom,mbhc-buttons-vthreshold-microvolt entry` error is a driver
+  logging bug: `wcd934x_init_dmic()` re-parses the MBHC config with the ASoC
+  component device, which has no `of_node`
+  (`/sys/bus/platform/devices/wcd934x-codec.4.auto/of_node` does not exist).
+  The real parse already happened in probe with the SLIMbus device, so headset
+  detection is unaffected; only the headset *button* thresholds get replaced
+  by the 500 mV default.
+* `command[0x10dac] not expecting rsp` / `0x10bdb` are `ASM_DATA_CMD_READ_V2`
+  and `ASM_DATA_CMD_EOS`. Both are response-less by design — cosmetic noise
+  from `q6asm.c`, not a capture fault.
+
 ## Not achievable with reasonable effort
 
 | Subsystem | Why |
@@ -164,8 +219,9 @@ so a proper UCM profile can be assembled from them later.
 
 ## Candidates not yet done
 
-* `regulatory.db` — install `wireless-regdb` (userspace, no kernel change).
 * Wi-Fi random MAC — the WLAN NV holds no per-unit MAC; set one statically.
+  Confirmed still open: three consecutive boots gave three different addresses
+  with `ath10k_snoc: invalid MAC address; choosing random`.
 * Watchdog — `qcom-wdt` is built, but this kernel's driver has no SC8180X
   compatible, so a DT node alone is not enough.
 * QCE crypto — driver present (`qcom,qce`), no DT node; register layout unknown.
