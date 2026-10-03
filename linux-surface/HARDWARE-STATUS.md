@@ -264,7 +264,33 @@ Windows driver store on `nvme0n1p3` (mount it read-only to look):
 
 Note `-s 340`: the configs declare `soc_id` 340 while the kernel reports
 `/sys/devices/soc0/soc_id` as **404**, and filtering on 404 yields an empty
-registry. Whether the SSC cares about that mismatch is not yet known.
+registry. The mismatch turns out not to matter.
+
+### Result: the accelerometer works
+
+Confirmed on hardware 2026-10-03:
+
+    remoteproc0: remote processor slpi is now up
+    qcom,fastrpc ...:fastrpc:compute-cb@1: Adding to iommu group 13   (and 14, 15)
+    /dev/fastrpc-sdsp present
+
+    Accelerometer sensor measurement: X=8.432084 Y=-0.004791 Z=4.963431 m/s^2
+
+which is gravity (|a| = 9.8 m/s^2).  The borrowed SM8150 SMMU stream IDs
+were correct — the compute context banks attached with no faults — and the
+`soc_id` 340/404 mismatch did not stop the SSC accepting the registry.
+
+Two things worth knowing:
+
+* `/dev/fastrpc-sdsp` comes up `crw------- root root`, so a udev rule is
+  needed for the unprivileged `fastrpc` user that the service runs as
+  (`KERNEL=="fastrpc-*", GROUP="fastrpc", MODE="0660"`).
+* libssc warns "Mount matrix provided by firmware is all 0, falling back to
+  identity matrix" — that is faithful: the vendor's own
+  `icm4x6xx_0_platform.placement` is all zeros with `orient` `+x/+y/+z`, so
+  identity is what the OEM declares.
+* `hexagonrpcd` logs "Tried to open .../sns_reg_version for writing" on a
+  loop; it serves the registry read-only, and this is harmless.
 
 Install staged at `~/qcom-slpi/install.sh` (hexagonrpcd, the configs, the
 registry, a systemd override passing `-R /usr/share/qcom/sc8180x/XIAOMI/BOOK124`).
