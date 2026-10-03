@@ -7,7 +7,7 @@ Board: `xiaomi,book-12.4` / `TM2133`, BIOS `XM28C2B0P16`, Qualcomm SC8180X
 
 | Subsystem | Driver / notes |
 |---|---|
-| Display | CSOT PNC357DB1-4 panel via Himax HX83121A, msm_dpu + DSI, pmc8180c WLED backlight |
+| Display | CSOT PNC357DB1-4 via Himax HX83121A, upstream `panel-himax-hx83121a` driver, single DSI0 link + DSC, msm_dpu, pmc8180c WLED backlight |
 | GPU | Adreno 680 (`adreno`, `msm`), ZAP shader `qcom/XIAOMI/BOOK124/qcdxkmsuc8180.mbn` |
 | Wi-Fi | WCN3990 (`ath10k_snoc`), fw `WLAN.HL.3.2.0.c8-…`. Random MAC each boot (`regulatory.db` now installed) |
 | NVMe | PCIe2 x2 lanes |
@@ -702,60 +702,79 @@ desktop file (or the script) to go back to running the recipe by hand.
   `reg` size `0x2c000`. Enumeration is a bus-level operation, so this is
   unlikely to be the amplifier blocker, but it is worth aligning.
 
-## Display: the mainline Himax HX83121A driver on a dual-DSI link
+## Display: the mainline Himax HX83121A driver (single DSI link)
 
-> Status: ported and built.  The dual link comes up completely (both DSI
-> controllers bound, connector enabled, no DSI/DSC errors) but the image is
-> garbled, so the panel is currently driven through the single-link fallback
-> with the DSC geometry the bring-up driver was verified with.  See "First
-> dual-link boot" and "Second dual-link boot" below.
+> Status: **verified working** — the upstream `panel-himax-hx83121a` driver
+> now drives the CSOT PNC357DB1-4 on DSI0 with DSC, replacing the bring-up
+> driver, and the image is correct.  Verified on hardware 2026-10-03 16:54.
 >
-> The single-DSI configuration described first in this section is the one
-> known to light the panel correctly.
+> ```
+> panel-himax-hx83121a ae94000.dsi.0: no secondary link, using single-link configuration
+> msm_dpu ae01000.display-controller: bound ae94000.dsi (ops dsi_ops [msm])
+> msm_dpu ae01000.display-controller: [drm] fb0: msmdrmfb frame buffer device
+> card0-DSI-1: connected, enabled, 1600x2560
+> ```
+>
+> A **dual-link** variant exists and comes up without a single DSI or DSC
+> error (both controllers bound, connector enabled) but renders garbage; the
+> open question is the DSC geometry the panel decoder expects.  See "First
+> dual-link boot" and "Second dual-link boot" below.
 
 The panel first came up with the bring-up driver on a **single** DSI0 link and
 a 1600-wide DSC slice, which needed three msm workarounds (one DSC block for a
 single-interface/single-slice topology, `DIV_ROUND_UP()` on the DSC active
 width, and wide bus disabled for DSI video mode).  Branch
 `xiaomi-mainline-panel2` replaces that driver with the upstream
-`panel-himax-hx83121a.c` and drives the panel over **both** DSI links, which is
-how the sibling CSOT/BOE PPC357DB1-4 panels and the mainline HX83121A driver
-work.
+`panel-himax-hx83121a.c`; the msm workarounds are unchanged and still needed.
 
 Ported pieces, all in `drivers/gpu/drm/panel/panel-himax-hx83121a.c`:
 
 * a `csot,pnc357db1-4` panel descriptor: the ACPI/GPU0 7-command init sequence,
-  the PPC357DB1-4 DSC configuration (800x20 slices, one per link) and
-  `needs_display_on`, because the ACPI sequence does not turn the display on
-  itself — that has to happen after the PPS and compression mode.
+  `needs_display_on` (the ACPI sequence does not turn the display on itself, so
+  that has to happen after the PPS and compression mode) and the DSC
+  parameters the panel was verified with — 1600-wide, slice height 40, one
+  slice;
+* a second descriptor `csot_pnc357db1_4_single_desc`, used automatically when
+  the panel node has no second graph port.  The dual-link descriptor keeps the
+  PPC357DB1-4 geometry (800x20 per link) for experiments;
 * a per-panel regulator list instead of the driver-wide `vddi`/`avdd`/`avee`,
-  so this board can use its own `vdd1`/`vddi`/`vdd` rails.
+  so this board can use its own `vdd1`/`vddi`/`vdd` rails;
 * support for the optional `enable-gpios` (TLMM 6, `DSI Mode Select` in the
-  ACPI tables), which the bring-up driver already used.
+  ACPI tables), which the bring-up driver already used;
 * `enable_dsc` now defaults to true; the panel cannot be driven without it.
   The full vendor sequence of the related PPC357DB1-4 remains selectable with
   the `pnc_full_init=1` parameter.
 
-Device tree: `&mdss_dsi0` and `&mdss_dsi1` are both enabled with
-`qcom,dual-dsi-mode` / `qcom,sync-dual-dsi`, DSI0 is the master, and DSI1's
-byte and pixel clocks are parented to the DSI0 PLL.  `panel@0` has
-`port@0` -> `mdss_dsi0_out` and `port@1` -> `mdss_dsi1_out`; the secondary
-DSI device is the usual empty `panel_secondary` node, which the driver
-registers itself.  Also fixed while here: the malformed comment that had
-swallowed the `chosen` node's closing brace, so the simple-framebuffer (and
-with it `bootargs`) is part of the DT again.
+Device tree: the default tree drives the panel from **DSI0 alone** — no
+`qcom,dual-dsi-mode` flags and no `panel_secondary` node, DSI1 left disabled —
+which is the configuration the panel was verified with (DTB md5
+`1adbba631ade4c166580ae3c66a58b41`).  The dual-link tree is kept as a separate
+DTB, see the dual-link section below.  Also fixed while here: the malformed
+comment that had swallowed the `chosen` node's closing brace, so the
+simple-framebuffer (and with it `bootargs`) is part of the DT again.
 
 Supporting changes: `select DRM_DISPLAY_DSC_HELPER` and
 `DRM_DISPLAY_HELPER` in the Kconfig entry, and the upstream
 `himax,hx83121a.yaml` binding extended with `csot,pnc357db1-4` and the
 `vdd1`/`vdd` supplies.
 
-Two caveats:
+One caveat: `enable_dsc = true` is a local default, not an upstream one.
 
-* the panel's DSC parameters are the ones the mainline driver uses for the
-  same IC on the Matebook E Go; if the image shows banding or distortion,
-  this is the first thing to reconsider;
-* `enable_dsc = true` is a local default, not an upstream one.
+### DSI node flags matter more than they look
+
+Two failures in this bring-up were caused purely by DSI device-tree shape, and
+both are worth remembering:
+
+* with DSI1 **enabled** but the secondary panel node carrying the panel
+  `compatible`, the DSI host instantiated a panel device for that node, the
+  driver probed it instead (it has no supplies and no reset GPIO) and the
+  driver's own secondary device registration then collided with it
+  (`-EEXIST`), taking the primary probe down as well;
+* with DSI1 **disabled** but `qcom,dual-dsi-mode` still set on DSI0, the msm
+  DSI manager takes the bonded path, finds no second DSI
+  (`other_dsi == NULL`) and returns success *without ever calling*
+  `msm_dsi_host_register()`.  No panel device, no DPU component, no DRM card:
+  a black screen with the backlight on.  This is silence, not an error message.
 
 ### First dual-link boot (2026-10-03 16:28) — no panel
 
@@ -830,16 +849,17 @@ geometry that mainline uses for the sibling PPC357DB1-4.  The bring-up driver
 was verified with a **1600-wide, slice-height-40, single slice**, and that is
 what drives the fallback below.
 
-### The single-link fallback
+### The shipped configuration and the experimental one
 
 `csot_pnc357db1_4_single_desc` is the same panel on DSI0 only, with the
 verified DSC parameters.  Probe picks it automatically when the panel node has
 no second graph port, so one kernel boots either wiring:
 
-* `panel-dtb/sc8180x-xiaomi-book-12.4.single-link.dtb` — DSI0 only, no
-  `port@1`, DSI1 left disabled;
-* `panel-dtb/sc8180x-xiaomi-book-12.4.dual-link.dtb` — the garbled dual-link
-  layout, kept for further experiments.
+* `panel-dtb/sc8180x-xiaomi-book-12.4.single-link.dtb` — **the default and the
+  one that renders correctly**: DSI0 only, no `port@1`, no dual-DSI flags,
+  DSI1 disabled (md5 `1adbba631ade4c166580ae3c66a58b41`);
+* `panel-dtb/sc8180x-xiaomi-book-12.4.dual-link.dtb` — both links, the layout
+  that renders garbage; kept for further DSC experiments.
 
 `./set-panel-link-mode.sh single|dual` installs either one into both
 GRUB-referenced DTB paths.
