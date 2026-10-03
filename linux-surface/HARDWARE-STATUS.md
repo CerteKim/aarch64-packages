@@ -704,10 +704,14 @@ desktop file (or the script) to go back to running the recipe by hand.
 
 ## Display: the mainline Himax HX83121A driver on a dual-DSI link
 
-> Status: ported, built and installed; the panel has **not** been verified on
-> this link yet — verification happens on the next reboot
-> (`./verify-mainline-panel.sh`).  Until then the single-DSI configuration
-> described first in this section is the one known to light the panel.
+> Status: ported, built and installed.  The first boot on the dual link
+> (2026-10-03 16:28) had **no panel** — both DSI links came up, but the panel
+> driver failed to probe because the secondary DSI node in the DT carried the
+> panel `compatible`; see "First dual-link boot" below.  The fix is built and
+> waiting to be installed.
+>
+> Until the link is proven, the single-DSI configuration described first in
+> this section is the one known to light the panel.
 
 The panel first came up with the bring-up driver on a **single** DSI0 link and
 a 1600-wide DSC slice, which needed three msm workarounds (one DSC block for a
@@ -753,6 +757,38 @@ Two caveats:
   this is the first thing to reconsider;
 * `enable_dsc = true` is a local default, not an upstream one.
 
+### First dual-link boot (2026-10-03 16:28) — no panel
+
+Both links came up (`dsi@ae94000` and `dsi@ae96000` both `okay` in the live
+DT, `msm` bound to both), but no DRM card was created at all: the panel driver
+failed to probe twice.
+
+```
+panel-himax-hx83121a ae96000.dsi.0: supply vdd1 not found, using dummy regulator
+panel-himax-hx83121a ae96000.dsi.0: error -ENOENT: Failed to get reset-gpios
+panel-himax-hx83121a ae96000.dsi.0: probe with driver panel-himax-hx83121a failed with error -2
+sysfs: cannot create duplicate filename '.../ae96000.dsi/ae96000.dsi.0'
+  himax_probe+0x2f4/0x3c0
+msm_dsi ae96000.dsi: failed to add DSI device -17
+panel-himax-hx83121a ae94000.dsi.0: cannot get secondary DSI device
+panel-himax-hx83121a ae94000.dsi.0: probe with driver panel-himax-hx83121a failed with error -17
+```
+
+Two chained problems, both from the DT shape, not from the panel:
+
+1. the `panel_secondary` node under `&mdss_dsi1` carried
+   `compatible = "csot,pnc357db1-4"`, so the DSI host instantiated a panel
+   device for it (`ae96000.dsi.0`) and the driver probed it; that node has no
+   supplies and no reset GPIO, hence `-ENOENT`;
+2. the driver then tried to register *its own* secondary DSI device on DSI1,
+   named `dsi-secondary`, which resolves to the same `ae96000.dsi.0` name and
+   collided (`-EEXIST`), taking the primary probe down with it.
+
+Fix: the secondary panel node is now a pure graph anchor and has **no**
+`compatible`.  That is also what upstream dual-DSI panels do (`nt36523`):
+the driver registers the secondary device itself.  The change is DTB-only —
+no kernel rebuild was needed.
+
 Install and rollback: `./install-mainline-panel.sh` (run as root) installs the
 kernel, the dual-link DTB and a fresh initramfs, and saves the previous
 kernel and DTBs under `/home/certe/panel-fallback-single-dsi/`;
@@ -760,6 +796,17 @@ kernel and DTBs under `/home/certe/panel-fallback-single-dsi/`;
 initramfs.  The boot partition is a 256M EFI partition with no room for two
 initramfs images, which is why the fallback initramfs is regenerated rather
 than stored.
+
+To replace only the DTB (no kernel reinstall), as after this fix:
+
+```
+sudo install -Dm644 \
+  src/kernel/arch/arm64/boot/dts/qcom/sc8180x-xiaomi-book-12.4.dtb \
+  /boot/dtb/linux-mibook/qcom/sc8180x-xiaomi-book-12.4.dtb
+sudo install -Dm644 \
+  src/kernel/arch/arm64/boot/dts/qcom/sc8180x-xiaomi-book-12.4.dtb \
+  /boot/dtb/linux-mibook/qcom/sc8180x-xiaomi-book-12.4-oc.dtb
+```
 
 ## Build note
 
