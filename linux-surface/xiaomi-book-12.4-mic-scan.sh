@@ -99,22 +99,31 @@ if not rms:
 mx, mn = max(rms), max(min(rms), 1.0)
 ratio = mx / mn
 peak = max(abs(x) for x in s)
-# a live mic follows the 1 Hz pulse; a dead one is flat
-verdict = "RESPONDS" if ratio > 1.8 else ("flat" if ratio < 1.3 else "weak?")
+# a live mic follows the 1 Hz pulse; a dead input is a flat noise floor;
+# all-zero samples mean the capture path never came up at all
+if peak == 0:
+    verdict = "SILENT (no path)"
+elif ratio > 1.8:
+    verdict = "RESPONDS"
+elif ratio < 1.3:
+    verdict = "flat"
+else:
+    verdict = "weak?"
 print(f"{iname:<14} {adcmux:<10} {selval:<12} {peak:<12} ratio={ratio:5.2f}  {verdict}")
 PY
 }
 
-probe "AMIC1"      AMIC ADC1 1
-probe "AMIC2"      AMIC ADC2 2
-probe "AMIC3"      AMIC ADC3 3
-probe "AMIC4"      AMIC ADC4 4
-probe "DMIC0"      DMIC DMIC0 1
-probe "DMIC1"      DMIC DMIC1 2
-probe "DMIC2"      DMIC DMIC2 3
-probe "DMIC3"      DMIC DMIC3 4
-probe "DMIC4"      DMIC DMIC4 5
-probe "DMIC5"      DMIC DMIC5 6
+# probe <label> <adc-mux-value> <selector-control> <selector-value>
+probe "AMIC1"      AMIC 'AMIC MUX0' ADC1
+probe "AMIC2"      AMIC 'AMIC MUX0' ADC2
+probe "AMIC3"      AMIC 'AMIC MUX0' ADC3
+probe "AMIC4"      AMIC 'AMIC MUX0' ADC4
+probe "DMIC0"      DMIC 'DMIC MUX0' DMIC0
+probe "DMIC1"      DMIC 'DMIC MUX0' DMIC1
+probe "DMIC2"      DMIC 'DMIC MUX0' DMIC2
+probe "DMIC3"      DMIC 'DMIC MUX0' DMIC3
+probe "DMIC4"      DMIC 'DMIC MUX0' DMIC4
+probe "DMIC5"      DMIC 'DMIC MUX0' DMIC5
 
 kill $TONE 2>/dev/null
 trap - EXIT INT TERM
