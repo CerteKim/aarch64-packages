@@ -704,14 +704,14 @@ desktop file (or the script) to go back to running the recipe by hand.
 
 ## Display: the mainline Himax HX83121A driver on a dual-DSI link
 
-> Status: ported, built and installed.  The first boot on the dual link
-> (2026-10-03 16:28) had **no panel** — both DSI links came up, but the panel
-> driver failed to probe because the secondary DSI node in the DT carried the
-> panel `compatible`; see "First dual-link boot" below.  The fix is built and
-> waiting to be installed.
+> Status: ported and built.  The dual link comes up completely (both DSI
+> controllers bound, connector enabled, no DSI/DSC errors) but the image is
+> garbled, so the panel is currently driven through the single-link fallback
+> with the DSC geometry the bring-up driver was verified with.  See "First
+> dual-link boot" and "Second dual-link boot" below.
 >
-> Until the link is proven, the single-DSI configuration described first in
-> this section is the one known to light the panel.
+> The single-DSI configuration described first in this section is the one
+> known to light the panel correctly.
 
 The panel first came up with the bring-up driver on a **single** DSI0 link and
 a 1600-wide DSC slice, which needed three msm workarounds (one DSC block for a
@@ -807,6 +807,42 @@ sudo install -Dm644 \
   src/kernel/arch/arm64/boot/dts/qcom/sc8180x-xiaomi-book-12.4.dtb \
   /boot/dtb/linux-mibook/qcom/sc8180x-xiaomi-book-12.4-oc.dtb
 ```
+
+### Second dual-link boot (2026-10-03 16:32) — links up, image garbled
+
+With the secondary node fixed the whole pipeline came up cleanly:
+
+```
+msm_dpu ae01000.display-controller: bound ae94000.dsi (ops dsi_ops [msm])
+msm_dpu ae01000.display-controller: bound ae96000.dsi (ops dsi_ops [msm])
+[drm] fb0: msmdrmfb frame buffer device
+```
+
+`card0-DSI-1` reports `connected`/`enabled` with two 1600x2560 modes and there
+is not a single DSI or DSC error in dmesg.  The panel nevertheless shows
+garbage: bright noise over the whole right half, the left half mostly
+white/grey with faint horizontal streaks and noise in its lower half, split
+exactly on the seam between the two 800-column links.
+
+So the two links, the timing and the DSC *transport* are all correct, but the
+panel's DSC decoder does not agree with the 800-wide, slice-height-20
+geometry that mainline uses for the sibling PPC357DB1-4.  The bring-up driver
+was verified with a **1600-wide, slice-height-40, single slice**, and that is
+what drives the fallback below.
+
+### The single-link fallback
+
+`csot_pnc357db1_4_single_desc` is the same panel on DSI0 only, with the
+verified DSC parameters.  Probe picks it automatically when the panel node has
+no second graph port, so one kernel boots either wiring:
+
+* `panel-dtb/sc8180x-xiaomi-book-12.4.single-link.dtb` — DSI0 only, no
+  `port@1`, DSI1 left disabled;
+* `panel-dtb/sc8180x-xiaomi-book-12.4.dual-link.dtb` — the garbled dual-link
+  layout, kept for further experiments.
+
+`./set-panel-link-mode.sh single|dual` installs either one into both
+GRUB-referenced DTB paths.
 
 ## Build note
 
