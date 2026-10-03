@@ -292,6 +292,32 @@ Two things worth knowing:
 * `hexagonrpcd` logs "Tried to open .../sns_reg_version for writing" on a
   loop; it serves the registry read-only, and this is harmless.
 
+### Getting the accelerometer to GNOME: `rotv`, not `accel`
+
+`iio-sensor-proxy` 3.9 does not ask the SSC for the accelerometer. It asks for
+two data types, and only one of them is what you would guess:
+
+    Discovering sensor UID for data type 'ambient_light'
+    Discovered 'ambient_light' sensor ... name: stk_stk3a5x     -> ALS exposed
+    Discovering sensor UID for data type 'rotv'
+    No 'rotv' sensor available                                  -> gives up
+
+So `HasAmbientLight` was true while `HasAccelerometer` stayed false, even
+though `ssccli --sensor accelerometer` printed gravity perfectly. iio-sensor-
+proxy wants a **rotation vector** fusion sensor.
+
+The fix is in the config selection, and it is a trap: the device's own
+`config_list.txt` does **not** list `sns_rotv.json` or `default_sensors.json`,
+but both are needed. Copying only the files `config_list.txt` names yields a
+registry with no `rotv` sensor. Include those two as well and regenerate:
+
+    sscregistrygen -p CLS -s 340 <configs> <out>
+
+which takes the registry from 47 to 58 files, adding `sns_rotv_platform`,
+`sns_rotv_platform.config` and the `default_sensors.{accel,gyro,mag,
+motion_detect}` bindings. The SSC reads the registry when the SLPI starts, so
+this needs a reboot rather than just a daemon restart.
+
 Install staged at `~/qcom-slpi/install.sh` (hexagonrpcd, the configs, the
 registry, a systemd override passing `-R /usr/share/qcom/sc8180x/XIAOMI/BOOK124`).
 
