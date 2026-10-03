@@ -18,7 +18,8 @@ Board: `xiaomi,book-12.4` / `TM2133`, BIOS `XM28C2B0P16`, Qualcomm SC8180X
 | Battery/charger | `qcom-battmgr` (pmic-glink) |
 | Thermal | `qcom-tsens` (2), `qcom-lmh`, 14 thermal zones |
 | RTC / lid / power key | `rtc-pm8xxx`, gpio-keys (tlmm 121) |
-| Remoteprocs | ADSP, CDSP, MPSS all running |
+| Remoteprocs | ADSP, CDSP, MPSS, SLPI all running |
+| Sensors | SSC via SLPI + hexagonrpcd (started by `hexagonrpcd-sdsp.path`): accelerometer `icm4x6xx`, ALS + proximity `stk3a5x`. Readings work; GNOME auto-rotation needs the inhibit recipe at login until mutter#4931 is fixed |
 
 ## Fixed in the `xiaomi-bringup` branch
 
@@ -207,7 +208,7 @@ microphone to fix.
   and `ASM_DATA_CMD_EOS`. Both are response-less by design — cosmetic noise
   from `q6asm.c`, not a capture fault.
 
-## SLPI / sensors — the DSP boots, the sensors still need FastRPC
+## SLPI / sensors — working (SLPI + FastRPC + a startup-claim fix)
 
 The accelerometer and everything else the device senses live on the Qualcomm
 Sensor Core, which runs on the SLPI (SPSS). `sc8180x.dtsi` had `smp2p-slpi`
@@ -292,6 +293,47 @@ Two things worth knowing:
 * `hexagonrpcd` logs "Tried to open .../sns_reg_version for writing" on a
   loop; it serves the registry read-only, and this is harmless.
 
+#### The daemon loses a boot race and systemd never retries it
+
+This one only shows up after a **reboot**, which is why it was missed at first.
+`hexagonrpcd-sdsp.service` ships with
+
+    ConditionPathExists=/dev/fastrpc-sdsp
+
+and is `WantedBy=multi-user.target`, but the kernel creates that node only after
+the SLPI's `fastrpc` driver has probed, about 1.3 s *after* systemd evaluates the
+unit:
+
+    12:57:40  systemd: skipped, unmet condition ConditionPathExists=/dev/fastrpc-sdsp
+    12:57:41  kernel:  qcom,fastrpc ... compute-cb@1: Adding to iommu group 13
+    12:57:41  /dev/fastrpc-sdsp created
+
+systemd does not re-evaluate a condition that failed, and the device's own udev
+rules only pull in `iio-sensor-proxy.service` (their `SYSTEMD_WANTS`), never
+`hexagonrpcd`. The daemon therefore never started, the SSC was never handed the
+sensor registry, and `iio-sensor-proxy` retried
+
+    'registry' sensor unavailable, retrying... (N/100)
+
+until it gave up — so the accelerometer simply did not exist after a reboot,
+while `hexagonrpcd-sdsp.service` still reported "enabled". Because the proxy
+does give up, `HasAccelerometer` read false and nothing rotated.
+
+Fix: a path unit, which has no such race - it activates at `multi-user.target`
+and starts the service whenever the device appears, before or after that point:
+
+    /etc/systemd/system/hexagonrpcd-sdsp.path     (staged in ~/qcom-slpi/usr/...)
+
+    [Path]
+    PathExists=/dev/fastrpc-sdsp
+    Unit=hexagonrpcd-sdsp.service
+
+`systemctl enable --now hexagonrpcd-sdsp.path`. The service keeps its condition
+(so a manual start without the device is still skipped), the path unit is what
+actually brings it up. Note the condition is also *sticky per attempt*, so
+recovery during a session needs the proxy restarted afterwards, since it has
+already given up on the registry.
+
 ### Getting the accelerometer to GNOME: `rotv`, not `accel`
 
 `iio-sensor-proxy` 3.9 does not ask the SSC for the accelerometer. It asks for
@@ -364,17 +406,285 @@ Note the mount matrix is the identity - libssc substitutes identity because the
 vendor ships zeros, and iio-sensor-proxy independently falls back to identity
 too, so the two agree.
 
+#### But `HasAccelerometer` was still not enough: the startup-claim race
+
+`HasAccelerometer: true` still did not make the accelerometer work, and this was
+the real blocker. iio-sensor-proxy owns its D-Bus name *before* it opens the
+sensors, and `name_acquired_handler()` then spends seconds on SSC discovery
+(each libssc client is a full QMUX connect + SUID + attribute round trip).
+gnome-shell claims the accelerometer as soon as the name appears, so the claim
+lands in that window:
+
+* at claim time `driver_type_exists (data, DRIVER_TYPE_ACCEL)` is still false,
+  so `handle_generic_method_call()` answers the claim with an immediate
+  success and never calls `set_polling()`;
+* the claim is nevertheless recorded in `data->clients[DRIVER_TYPE_ACCEL]`;
+* when the device is finally opened, nothing revisits that claim - and because
+  `g_hash_table_size (ht) != 1`, every later claim takes the "client added while
+  sensor is active" branch and returns success without starting anything either.
+
+The sensor is therefore dead for the entire session, while the D-Bus API claims
+it is present and working. Hardware evidence from the instrumented proxy:
+
+    XIAOMI-CLAIM: inserted sender=:1.54 ht_size=1        <- gnome-shell, too early, no-op
+    XIAOMI-CLAIM: type=0 device=0x... driver=0x... drv=0x...   <- later claim, driver IS correct
+    XIAOMI-CLAIM: ht_size=2 invocations_delayed=0 event_delayed=0   <- so it only returns success
+
+`ssc_accelerometer_set_polling()` was never entered, and the same race can hit
+light, proximity or an `input-accel` device. The fix is one block in the
+device-opening loop of `name_acquired_handler()`: if clients are already
+waiting, start polling once the device has been opened.
+
+    if (g_hash_table_size (data->clients[i]) > 0) {
+        g_debug ("Sensor %s was claimed during startup, starting it",
+                 driver_type_to_str (i));
+        driver_set_polling (sensor_device, TRUE);
+    }
+
+Staged as `~/qcom-slpi/iio-sensor-proxy/0001-start-sensor-claimed-during-
+startup.patch` and installed to `/usr/local/lib/iio-sensor-proxy/` by
+`~/qcom-slpi/install-iio-proxy.sh` (the packaged `/usr/lib/iio-sensor-proxy` is
+left untouched). Confirmed on hardware 2026-10-03:
+
+    Sensor accelerometer was claimed during startup, starting it
+    Accel sent by driver (quirk applied): 8, 0, 4 (scale: 1.0,1.0,1.0)
+    Emitted orientation changed: from undefined to left-up
+
+and D-Bus then reports a real orientation instead of `undefined`:
+
+    === Has accelerometer (orientation: left-up, tilt: tilted-up)
+
+#### The mount matrix: the panel is portrait and the sensor frame is rotated
+
+Getting measurements through was not enough to make screen rotation *correct*.
+
+The panel's native mode is **1600x2560, i.e. portrait** (the only mode `DSI-1`
+offers, matching the DT). Per the BIOS, in the native image direction the
+**camera edge is the 2560px (long) side on the right**, the **keyboard edge is
+the long side on the left**, the **pen magnet is on a 1600px (short) side, top**
+and the **power button on the other short side, bottom** - so a
+keyboard-attached landscape desktop needs mutter to apply a **90/270 degree
+transform (`1` or `3`)**. Transforms `0` and `2` are portrait and come up wrong.
+(Mutter's values: `0` = normal, `1` = 90°, `2` = 180°, `3` = 270°; there is no
+`8`.)
+
+The vendor sensor frame is rotated against that panel, and it is also mirrored
+relative to it. In the keyboard-landscape hold the raw sample is about
+`(8.7, 0.1, 4.5) m/s²`, with `+Z` the screen normal (screen up on a table reads
+`Z=+10`), so the in-plane gravity component sits mostly on `x` - which
+`orientation_calc()` reads as a **portrait** hold, picking `left-up` or
+`right-up` from the sign of `x`. Getting landscape right therefore means fixing
+the frame's handedness, not moving the gravity component onto `y`.
+
+The corrected value (row-major, rows separated by `;`), staged at
+`~/qcom-slpi/udev/92-fastrpc-accel-matrix.rules`, is a **180° rotation about the
+screen normal**:
+
+    SUBSYSTEM=="misc", KERNEL=="fastrpc-sdsp*", \
+        ENV{ACCEL_MOUNT_MATRIX}="-1,0,0;0,-1,0;0,0,1"
+
+It falls straight out of `orientation.c`:
+
+    portrait_rotation  = atan2 (x, sqrt (y*y + z*z))
+    landscape_rotation = atan2 (y, sqrt (x*x + z*z))
+
+`|portrait| > 35°` picks `left-up`/`right-up` from the **sign of x**;
+otherwise `|landscape| > 35°` picks `bottom-up`/`normal` from the **sign of y**.
+Both earlier values were wrong, in instructive ways:
+
+* `0,-1,0;1,0,0;0,0,1` (documented first) is a 90° rotation. It shifts the
+  gravity component into the landscape branch, so the keyboard-landscape hold
+  reports `bottom-up` -> transform 180, i.e. an upside-down **portrait** image;
+  it had been picked for a `transform 8` that does not exist.
+* `1,0,0;0,-1,0;0,0,1` is what the later matrix sweep actually left installed in
+  `/etc/udev/rules.d/92-fastrpc-accel-matrix.rules`. Its determinant is `-1`, so
+  it is a **reflection** and inverts the handedness of the sensor frame: the
+  observed profile on this panel is *portrait fine, both landscape holds 180°
+  out*.
+* negating `x` as well (`-1,0,0;0,-1,0;0,0,1`, `det = +1`) swaps
+  `left-up`↔`right-up` and leaves `normal`/`bottom-up` untouched. Checked
+  against the 18 `(quirked vector -> orientation)` pairs logged while rotating
+  the device: all 8 portrait samples keep their label, all 10 landscape samples
+  swap.
+
+Mutter's transform numbering, for the record (it is *not* the XRandR bitmask,
+and there is no value 8):
+
+    0 = normal   1 = 90°   2 = 180°   3 = 270°
+
+Measured live against this panel once mutter was holding the sensor:
+`left-up` -> `1`, `normal` -> `0`, `right-up` -> `3`. So the mapping is the bare
+`meta_orientation_to_transform()`, `bottom-up` -> `2`, and the panel's own
+orientation transform is `0` (`normal`) - there is no extra composition to
+account for.
+
+Note the format trap: `strsplit_num_tokens()` wants `-1,0,0;0,-1,0;0,0,1`, not
+`-1,0,0,0,-1,0,0,0,1` (that fails with "Failed to parse ACCEL_MOUNT_MATRIX").
+
+`libssc` applies the vendor matrix to every sample before iio-sensor-proxy ever
+sees it (`ssc_accelerometer_response` → `priv->mount_matrix`), and its
+`SSC_SENSOR_MOUNT_MATRIX` property is `G_PARAM_READABLE`, so the board cannot be
+corrected through the sensor properties. The fix is to let the SSC driver honour
+the standard `ACCEL_MOUNT_MATRIX` udev property, which `setup_mount_matrix()`
+already parses for the IIO drivers.
+
+The **base transform** GNOME stores for `DSI-1` is `<rotation>right</rotation>`
+in `~/.config/monitors.xml` (the 1600x2560 portrait mode at 270 degrees) - the
+"landscape left" setting chosen in GNOME. Mutter composes that base with the
+accelerometer reading, so with the corrected matrix the two landscape holds map
+to transforms `3` and `1` - one of them is the stored `right`.
+
+
+##### Mutter will not retry a failed claim
+
+Worth knowing while testing, and it bit twice here:
+`meta-orientation-manager.c` only calls `ClaimAccelerometer` when `should_claim`
+*changes* - driven by the D-Bus proxy being (re)created, or by the
+orientation-lock inhibit count. A failed claim is **never retried** for that
+session, and `HasAccelerometer` keeps reading true, so rotation silently does
+nothing while the screen stays frozen at its stored transform. Reloading the
+shell (Alt+F2, `r`) or logging out/in is what re-arms it.
+
+##### The remaining reason rotation dies at login: mutter drives its inhibit count negative
+
+Even with the claim patch, auto-rotation is dead after **every** login on this
+machine. This one is a mutter 50 bug, not a sensor problem:
+[mutter#4931](https://gitlab.gnome.org/GNOME/mutter/-/work_items/4931) - the
+compositor half. The daemon half is
+[iio-sensor-proxy MR!414](https://gitlab.freedesktop.org/hadess/iio-sensor-proxy/-/merge_requests/414);
+both are still open as of mutter 50.4 / iio-sensor-proxy 3.9.
+
+`should_claim` is `iio_proxy && inhibited_count == 0`, and
+`meta_orientation_manager_uninhibit_tracking()` only re-evaluates the claim when
+`inhibited_count` lands on exactly 0. At startup `panel_orientation_managed` is
+`FALSE`; the first `update_panel_orientation_managed()` early-returns on the
+`FALSE == FALSE` no-op *without* inhibiting; then `HasAccelerometer` arriving
+`FALSE -> TRUE` flips it `FALSE -> TRUE`, calling `uninhibit_tracking()`
+**unpaired**. `inhibited_count` goes `0 -> -1`, `sync_accelerometer_claimed()`
+is skipped because it only runs on the `0`/`1` boundaries, and `should_claim` is
+never recomputed. Mutter therefore never sends `ClaimAccelerometer` for the
+whole session, while `HasAccelerometer` and the auto-rotate toggle both read
+`true`.
+
+Hardware evidence (journal, session started 14:11 on 2026-10-03):
+
+    iio-sensor-proxy: zero ClaimAccelerometer lines for that session
+    Mutter DisplayConfig: PanelOrientationManaged = true   <- mutter thinks it
+                          manages the panel, and still never claims the sensor
+    a manual gdbus ClaimAccelerometer from the same session works and streams
+                          12.5 Hz
+
+`PanelOrientationManaged = true` is the tell. On this board the ordering is
+deterministic: mutter has the builtin monitor before the sensor proxy's
+property arrives, so the unpaired uninhibit always happens.
+
+##### Working around it in the running session
+
+Two inhibits followed by one uninhibit walk the count `-1 -> 0 -> 1 -> 0`; the
+last step lands on 0, mutter re-evaluates and claims. Run inside the user
+session (`DBUS_SESSION_BUS_ADDRESS` set); it costs one ~1 s DPMS blink:
+
+    gsettings set org.gnome.settings-daemon.peripherals.touchscreen orientation-lock true
+    gdbus call --session --dest org.gnome.Mutter.DisplayConfig \
+      --object-path /org/gnome/Mutter/DisplayConfig \
+      --method org.freedesktop.DBus.Properties.Set \
+      org.gnome.Mutter.DisplayConfig PowerSaveMode "<int32 1>"
+    gdbus call --session --dest org.gnome.Mutter.DisplayConfig \
+      --object-path /org/gnome/Mutter/DisplayConfig \
+      --method org.freedesktop.DBus.Properties.Set \
+      org.gnome.Mutter.DisplayConfig PowerSaveMode "<int32 0>"
+    gsettings set org.gnome.settings-daemon.peripherals.touchscreen orientation-lock false
+
+##### Installed: the recipe runs itself at login
+
+Since the failure repeats on **every** login, the recipe is wrapped in
+`mutter-accelerometer-claim.sh` (in this repo, installed to
+`~/.local/bin/mutter-accelerometer-claim.sh`) and started by
+`~/.config/autostart/mutter-accelerometer-claim.desktop`
+(`X-GNOME-Autostart-Delay=8`; delete that file to disable it).
+
+The script waits for `org.gnome.Mutter.DisplayConfig` and for
+`HasAccelerometer = true`, gives mutter a further 6 s to reach the broken state,
+does nothing if the sensor already looks claimed *or* if the user has the
+rotation lock on (`orientation-lock=true`, where not claiming is correct), then
+runs the recipe above and verifies that readings start. It always restores
+`PowerSaveMode` and the lock via an EXIT trap. Result is logged to
+`~/.local/state/mutter-accelerometer-claim.log`:
+
+    2026-10-03 14:28:25 accelerometer already claimed (orientation right-up); nothing to do
+    2026-10-03 14:28:32 mutter claimed the accelerometer (orientation right-up)
+
+Both paths were exercised on hardware: a no-op run while the sensor was already
+claimed, and `--force` (Release+Claim in the journal, orientation restored).
+
+Verified on hardware: immediately after a poke, the journal shows `Handling
+driver refcounting method 'ClaimAccelerometer'` plus continuous `Accel sent by
+driver` readings, and the transform tracks the orientation. Note that the
+*first* orientation event after a first claim still runs
+`orientation_changed()`'s initial-config inhibit in `meta-monitor-manager.c` and
+releases the sensor once; the second claim - the one this recipe produces -
+sticks, because `initial_orient_change_done` is set by then.
+
+Decision taken here: **wait for the upstream fix** rather than rebuild mutter,
+and let the autostart entry run the recipe after each login. If mutter is ever
+patched locally, the fix is to keep inhibit/uninhibit balanced around
+`panel_orientation_managed` (or to guard `uninhibit_tracking()` against
+underflow and re-evaluate `should_claim` whenever its inputs change).
+
+##### The "sample rate" red herring
+
+`libssc`'s `sample-rate` property is `G_PARAM_READABLE` and carries the value
+the SSC itself declares, so `g_object_set (sensor, SSC_SENSOR_SAMPLE_RATE, …)`
+is both impossible and unnecessary - the firmware rate (12.5 Hz for the
+`icm4x6xx`) is what `ssc_sensor_open()` already sends. An earlier attempt to
+force 12.5 Hz was reverted; `ssccli --sensor accelerometer` and a plain
+`new_sync()` + `open_sync()` both stream fine without it.
+
+##### Cheaper workaround (no patch)
+
+If rebuilding iio-sensor-proxy is not wanted, `systemctl restart
+iio-sensor-proxy` and then claim the accelerometer *after* the proxy has settled
+- but this cannot be relied on, because gnome-shell always claims first. This is
+why the session-wide fix above is the useful one. (Restarting the proxy is also
+not enough by itself for the inhibit-count bug below - the name appearing again
+re-runs the same unpaired uninhibit.)
+
 The compass remains unavailable (`No 'rotv' sensor available`), which is real:
 libssc's compass support wants a rotation vector this firmware does not
 expose. iio-sensor-proxy has no `HasCompass` property at all, so it is
 cosmetic.
+
+### Summary — sensors now working
+
+    accelerometer (icm4x6xx)                          WORKING
+    screen rotation                                   WORKING; mutter#4931 means
+                                                      mutter only claims the
+                                                      sensor after the inhibit
+                                                      recipe - installed as a
+                                                      GNOME autostart entry
+    ambient light (stk3a5x)                           WORKING
+    proximity     (stk3a5x)                           WORKING
+    compass                                           not exposed by firmware
+
+Mount matrix: **applied**. `/etc/udev/rules.d/92-fastrpc-accel-matrix.rules` now
+holds the corrected `-1,0,0;0,-1,0;0,0,1` (identical to the copy in
+`~/qcom-slpi/udev/`), confirmed by `udevadm info /dev/fastrpc-sdsp`. The
+commands that were used:
+
+    sudo cp ~/qcom-slpi/udev/92-fastrpc-accel-matrix.rules /etc/udev/rules.d/
+    sudo udevadm control --reload
+    sudo udevadm trigger --sysname-match=fastrpc-sdsp
+    sudo systemctl restart iio-sensor-proxy
+
+Auto-rotation claim: **automated**. `~/.config/autostart/mutter-accelerometer-claim.desktop`
+starts `~/.local/bin/mutter-accelerometer-claim.sh` after each login; delete the
+desktop file (or the script) to go back to running the recipe by hand.
 
 ## Not achievable with reasonable effort
 
 | Subsystem | Why |
 |---|---|
 | Cameras | SC8180X has **no** upstream CAMSS support at all — no `camss`/`cci` nodes in `sc8180x.dtsi`. Sensors are likely S5K3L6 (rear), GC5035 (front), OV7251 (IR). This is a from-scratch upstream port. |
-| Accelerometer / gyro / ALS | The SLPI now boots and exposes the Sensor Core (see below); the sensors themselves are still waiting on the FastRPC daemon. |
 | Fingerprint | None present in hardware (face unlock uses the IR camera). |
 | Venus video codec | The driver exists (`qcom,sm8250-venus`) but there is no DT node and no firmware packaged. Needs board-specific work. |
 | Charger (TXRA9536) | No upstream driver. |
@@ -391,6 +701,65 @@ cosmetic.
   community SC8180X tree uses `num-channels = <31>`, `qcom,num-ees = <2>`,
   `reg` size `0x2c000`. Enumeration is a bus-level operation, so this is
   unlikely to be the amplifier blocker, but it is worth aligning.
+
+## Display: the mainline Himax HX83121A driver on a dual-DSI link
+
+> Status: ported, built and installed; the panel has **not** been verified on
+> this link yet — verification happens on the next reboot
+> (`./verify-mainline-panel.sh`).  Until then the single-DSI configuration
+> described first in this section is the one known to light the panel.
+
+The panel first came up with the bring-up driver on a **single** DSI0 link and
+a 1600-wide DSC slice, which needed three msm workarounds (one DSC block for a
+single-interface/single-slice topology, `DIV_ROUND_UP()` on the DSC active
+width, and wide bus disabled for DSI video mode).  Branch
+`xiaomi-mainline-panel2` replaces that driver with the upstream
+`panel-himax-hx83121a.c` and drives the panel over **both** DSI links, which is
+how the sibling CSOT/BOE PPC357DB1-4 panels and the mainline HX83121A driver
+work.
+
+Ported pieces, all in `drivers/gpu/drm/panel/panel-himax-hx83121a.c`:
+
+* a `csot,pnc357db1-4` panel descriptor: the ACPI/GPU0 7-command init sequence,
+  the PPC357DB1-4 DSC configuration (800x20 slices, one per link) and
+  `needs_display_on`, because the ACPI sequence does not turn the display on
+  itself — that has to happen after the PPS and compression mode.
+* a per-panel regulator list instead of the driver-wide `vddi`/`avdd`/`avee`,
+  so this board can use its own `vdd1`/`vddi`/`vdd` rails.
+* support for the optional `enable-gpios` (TLMM 6, `DSI Mode Select` in the
+  ACPI tables), which the bring-up driver already used.
+* `enable_dsc` now defaults to true; the panel cannot be driven without it.
+  The full vendor sequence of the related PPC357DB1-4 remains selectable with
+  the `pnc_full_init=1` parameter.
+
+Device tree: `&mdss_dsi0` and `&mdss_dsi1` are both enabled with
+`qcom,dual-dsi-mode` / `qcom,sync-dual-dsi`, DSI0 is the master, and DSI1's
+byte and pixel clocks are parented to the DSI0 PLL.  `panel@0` has
+`port@0` -> `mdss_dsi0_out` and `port@1` -> `mdss_dsi1_out`; the secondary
+DSI device is the usual empty `panel_secondary` node, which the driver
+registers itself.  Also fixed while here: the malformed comment that had
+swallowed the `chosen` node's closing brace, so the simple-framebuffer (and
+with it `bootargs`) is part of the DT again.
+
+Supporting changes: `select DRM_DISPLAY_DSC_HELPER` and
+`DRM_DISPLAY_HELPER` in the Kconfig entry, and the upstream
+`himax,hx83121a.yaml` binding extended with `csot,pnc357db1-4` and the
+`vdd1`/`vdd` supplies.
+
+Two caveats:
+
+* the panel's DSC parameters are the ones the mainline driver uses for the
+  same IC on the Matebook E Go; if the image shows banding or distortion,
+  this is the first thing to reconsider;
+* `enable_dsc = true` is a local default, not an upstream one.
+
+Install and rollback: `./install-mainline-panel.sh` (run as root) installs the
+kernel, the dual-link DTB and a fresh initramfs, and saves the previous
+kernel and DTBs under `/home/certe/panel-fallback-single-dsi/`;
+`./tools/restore-single-dsi-panel.sh` puts them back and regenerates the
+initramfs.  The boot partition is a 256M EFI partition with no room for two
+initramfs images, which is why the fallback initramfs is regenerated rather
+than stored.
 
 ## Build note
 
