@@ -9,8 +9,13 @@
 # two halves of one recording can be compared directly.
 #
 # Usage:
-#   ./xiaomi-book-12.4-mic-tap-test.sh              # walks ADC1..ADC4
-#   ./xiaomi-book-12.4-mic-tap-test.sh ADC1         # just one input
+#   ./xiaomi-book-12.4-mic-tap-test.sh              # walks DMIC0..DMIC5
+#   ./xiaomi-book-12.4-mic-tap-test.sh ADC3         # just one input
+#   ./xiaomi-book-12.4-mic-tap-test.sh DMIC2 DMIC3  # any subset
+#
+# Accepts ADC1..ADC4 (WCD9340 analogue mic inputs) and DMIC0..DMIC5 (its
+# digital mic inputs).  The analogue ones have already been tested and are
+# all dead on this machine, so the digital ones are the default.
 #
 # When it says so: stay quiet for the first 3 seconds, then tap firmly on the
 # tablet body near the camera / mic grille and talk at it until it ends.
@@ -22,7 +27,9 @@ TMP="${TMPDIR:-/tmp}/mic-tap"
 mkdir -p "$TMP"
 
 INPUTS="$*"
-[ -n "$INPUTS" ] || INPUTS="ADC1 ADC2 ADC3 ADC4"
+# The analogue inputs were tested first and all came back dead, so default to
+# the digital ones.  Pass explicit names to test anything.
+[ -n "$INPUTS" ] || INPUTS="DMIC0 DMIC1 DMIC2 DMIC3 DMIC4 DMIC5"
 
 cset() { amixer -D "$CARD" -q cset "name='$1'" "$2" >/dev/null 2>&1; }
 
@@ -31,19 +38,26 @@ if wpctl set-mute @DEFAULT_AUDIO_SINK@ 1 >/dev/null 2>&1; then
 	echo "  speaker muted -- the only sound will be you"
 fi
 
-# Do not touch ADC MUX0 while switching: driving it to ZERO wedges the TX
-# path.  Switching AMIC MUX0 straight between inputs is what works.
-cset 'ADC MUX0' AMIC
+# Do not drive ADC MUX0 (or AMIC MUX0) to ZERO while switching: that wedges
+# the TX path.  Just point the selectors straight at the input we want.
 cset 'AIF1_CAP Mixer SLIM TX0' 1
 cset 'CDC_IF TX0 MUX' DEC0
 
 for iname in $INPUTS; do
 	case "$iname" in
-	ADC1|ADC2|ADC3|ADC4) ;;
-	*) echo "skipping '$iname' (expected ADC1..ADC4)"; continue ;;
+	ADC1|ADC2|ADC3|ADC4)
+		cset 'ADC MUX0' AMIC
+		cset 'AMIC MUX0' "$iname"
+		;;
+	DMIC0|DMIC1|DMIC2|DMIC3|DMIC4|DMIC5)
+		cset 'ADC MUX0' DMIC
+		cset 'DMIC MUX0' "$iname"
+		;;
+	*)
+		echo "skipping '$iname' (expected ADC1..ADC4 or DMIC0..DMIC5)"
+		continue
+		;;
 	esac
-
-	cset 'AMIC MUX0' "$iname"
 	sleep 2
 
 	echo
@@ -110,10 +124,10 @@ cat <<'EOF'
 How to read it:
   LIVE on some input -> that input is the real microphone; tell me which one
                         and I will point the UCM profile and the DTS at it.
-  dead on all        -> the mics are not on the WCD9340 analog inputs, so we
-                        go after DMIC or the DAPM state instead.
+  dead on all        -> the mics are not on the WCD9340 at all, and the next
+                        step is the DAPM state / a different capture block.
   IDLE on some       -> that input never powered up; rerun it alone:
-                           ./xiaomi-book-12.4-mic-tap-test.sh ADC3
+                           ./xiaomi-book-12.4-mic-tap-test.sh DMIC3
 
 The "lift" is the loud-window mean divided by the loudest quiet window.  A
 microphone hearing you tap gives a big number; electrical crosstalk and a
