@@ -13,17 +13,17 @@ arch=("aarch64")
 options=("!strip")
 makedepends=('xmlto' 'docbook-xsl' 'kmod' 'inetutils' 'bc' 'git' 'dtc')
 
-_ref_ksource="7167da3a8f507004672ccbd20092d8b917ccbb65"
+_ref_ksource="f21bd1c66f26f56e2140372a6fa128256556674d"
 _ref_config_base="e36ada85974d22c05d1442a4ac47f958c7fa8e15"
 
 source=(
     "kernel::git+https://github.com/CerteKim/linux-a51.git#commit=${_ref_ksource}"
-    "base.config::https://raw.githubusercontent.com/archlinuxarm/PKGBUILDs/${_ref_config_base}/core/linux-aarch64/config"
+    "base.config"
     "linux-mibook.preset"
     "xiaomi-only.config"
 )
 sha256sums=('SKIP'
-            '7224624cb815e7c4d989cea2d8c6abf25f02c280db66ce28e023e12cb177965f'
+            'SKIP'
             'SKIP'
             'SKIP'
 )
