@@ -970,6 +970,21 @@ for IRIS1:
   `iris_platform_sm8250.o` when venus is *not* selected, and no sc8180x board
   uses the venus driver.
 
+The device-tree side has been checked as far as software can take it:
+
+* `0xaa00000` overlaps nothing in the SC8180X memory map (camera ends at
+  `0xa8f8800`, VIDEOCC starts at `0xab00000`, so Venus sits between them, which
+  is what the address map implies);
+* `apps_smmu 0x2100 0x0400` is used by no other node on this SoC;
+* `GIC_SPI 174` is used by no other node on this SoC, and it is the same
+  interrupt that sm8250 and sc7180 use for Venus;
+* the clock names (`iface`, `core`, `vcodec0_core`), the power domains
+  (`venus`, `vcodec0`, `mx`) and the resets (`bus`, `core`) all resolve to the
+  videocc this device tree already instantiates.
+
+So a failing probe now points at the VPU/PCIe-side details (physical address
+space id, secure context bank) or at the firmware, not at the memory map.
+
 What is still missing before a decoder can work:
 
 1. firmware: the Windows `qcvss8180.mbn` is signed for the Windows PIL path
