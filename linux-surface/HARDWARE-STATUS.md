@@ -207,12 +207,60 @@ microphone to fix.
   and `ASM_DATA_CMD_EOS`. Both are response-less by design — cosmetic noise
   from `q6asm.c`, not a capture fault.
 
+## SLPI / sensors — the DSP boots, the sensors still need FastRPC
+
+The accelerometer and everything else the device senses live on the Qualcomm
+Sensor Core, which runs on the SLPI (SPSS). `sc8180x.dtsi` had `smp2p-slpi`
+but no remoteproc node, so the SLPI never booted. It does now — the branch
+adds a `remoteproc_slpi@2400000` node, a `qcom,sc8180x-slpi-pas` compatible in
+`qcom_q6v5_pas.c` (reusing `sdm845_slpi_resource_init`), and the
+`0x92c00000` reserved region from the Windows memory map.
+
+The SM8150 values were borrowed and they are correct: the two SoCs share
+identical MPSS/CDSP/ADSP register bases and ADSP wdog IRQ, the `smp2p-slpi`
+nodes are byte-for-byte identical, and SM8150's `slpi_mem` is `0x1400000`,
+exactly the SPSS/SLPI size in this machine's Windows memory map. The firmware
+is `qcom/XIAOMI/BOOK124/qcslpi8180.mbn`, taken from the Windows driver store
+package `qcsubsys_ext_scss8180.inf_arm64_82a97072e5b00832`.
+
+Boot result:
+
+    remoteproc remoteproc0: Booting fw image qcom/XIAOMI/BOOK124/qcslpi8180.mbn
+    remoteproc remoteproc0: remote processor slpi is now up
+
+and the Sensor Core service then appears on QRTR:
+
+    400  1  0  9  12  Snapdragon Sensor Core service
+
+`libssc` (0.4.4, already installed, along with `iio-sensor-proxy` 3.9)
+connects to it as a QMI client on `qrtr://9/` — but the sensor registry
+never becomes available, so no sensor reports. libssc says why itself:
+
+    'registry' sensor unavailable, is hexagonrpcd running?
+
+That is `sscrpd` in downstream terms: a **FastRPC daemon** that reads the
+vendor's sensor JSON configs (bus type, address, mount matrix, …) from the
+persist partition and pushes them to the SSC. Without it the SSC has no
+sensors to report. Upstream hit the same wall on the Yoga C630 — Baryshkov's
+patch enabling `slpi_pas` there notes the DSP "provides QMI services, however
+it is of limited functionality due to the missing `fastrpc_shell_1` binary".
+
+So what is left is the FastRPC chain, and none of it is DT-free work:
+
+1. a `fastrpc` node under the SLPI's `glink-edge` — `sc8180x.dtsi` has none
+   for any DSP, and the SMMU stream IDs for this SoC are not known from any
+   source on hand;
+2. `hexagonrpcd` in userspace — not in the Arch repos, so it has to be built;
+3. the sensor JSON configs for this device, plus the FastRPC shell binary,
+   both presumably in the Windows driver store (the partition was unmounted
+   before this could be checked).
+
 ## Not achievable with reasonable effort
 
 | Subsystem | Why |
 |---|---|
 | Cameras | SC8180X has **no** upstream CAMSS support at all — no `camss`/`cci` nodes in `sc8180x.dtsi`. Sensors are likely S5K3L6 (rear), GC5035 (front), OV7251 (IR). This is a from-scratch upstream port. |
-| Accelerometer / gyro / ALS | Handled by Qualcomm Sensor Core behind SLPI. No SLPI remoteproc node, no `fastrpc`, no upstream driver. Not visible to the application processor. |
+| Accelerometer / gyro / ALS | The SLPI now boots and exposes the Sensor Core (see below); the sensors themselves are still waiting on the FastRPC daemon. |
 | Fingerprint | None present in hardware (face unlock uses the IR camera). |
 | Venus video codec | The driver exists (`qcom,sm8250-venus`) but there is no DT node and no firmware packaged. Needs board-specific work. |
 | Charger (TXRA9536) | No upstream driver. |
