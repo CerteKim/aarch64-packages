@@ -38,12 +38,53 @@ already installed by `linux-firmware`. The linux-surface project works around
 the same bug with `crbtfw01.tlv -> crbtfw21.tlv` symlinks; these are no longer
 needed.
 
-Note: even in ROM mode `hci0` comes up, but with no patch/NVM and a bogus BD
-address. After the fix, set the address if the NVM still has none:
+Even in ROM mode `hci0` comes up, but with no patch/NVM and a bogus BD address.
+
+#### Bluetooth address (board has none) — fixed in the device tree
+
+This board was never provisioned with a BD address (no on-chip OTP and nothing
+in secure world), so the chip boots with the placeholder that the generic
+`qca/crnv21.bin` NVM carries as its tag-2 default. On this unit that shows up
+as `39:90:21:64:07:00` (the same six bytes, `00 07 64 21 90 39`, read in the
+other direction).
+
+`qca_check_bdaddr()` reads the address back after the NVM download and, if the
+controller still reports the NVM default, sets
+`HCI_QUIRK_USE_BDADDR_PROPERTY`. With no `local-bd-address` in the device tree,
+the kernel then leaves the controller `HCI_UNCONFIGURED`:
+
+* `hciconfig` shows `hci0` as `DOWN RAW`, yet
+* `bluetoothctl list` and `btmgmt info` are empty — the adapter only sits in
+  the *unconfigured* mgmt index list, so BlueZ never powers it up.
+
+`btmgmt --index 0 public-addr …` supplies the missing config option and makes
+it work, but only until the next power cycle (the address is not persistent),
+so it has to be repeated after every boot.
+
+The device tree now provides the address, and the kernel programs it into the
+chip during setup (`qca_set_bdaddr`) before bluetoothd starts:
 
 ```
-btmgmt --index 0 public-addr <your-mac>
+local-bd-address = [55 44 33 22 11 00];	/* 00:11:22:33:44:55 */
 ```
+
+`local-bd-address` is little-endian, per
+`Documentation/devicetree/bindings/net/bluetooth/bluetooth-controller.yaml`,
+so the property above is the address `00:11:22:33:44:55`.
+`qcom,local-bd-address-broken` is *not* needed here (that flag is for boot
+firmware that passes the value big-endian). The value is synthetic and per
+board — there is no stored address anywhere on this machine to recover — and
+it is shared by every user of this DTB.
+
+Deploying it is the usual DTB swap plus a reboot:
+
+```
+sudo ./set-panel-link-mode.sh single    # or: dual
+sudo reboot
+```
+
+Both `panel-dtb/sc8180x-xiaomi-book-12.4.{single,dual}-link.dtb` carry the
+property, so the address survives switching panel link modes.
 
 ### Audio (WCD9340 + WSA881x) — WORKING
 
@@ -83,7 +124,9 @@ A boot of the first build confirmed:
 * **Both** amplifiers enumerate — `sdw:0:0:0217:2110:00:3` (left) and
   `sdw:0:0:0217:2110:00:4` (right). The GPIO hog is what fixed the left one.
 * Bluetooth loads `qca/crbtfw21.tlv` + `qca/crnv21.bin`, reports "QCA setup on
-  UART is completed" and gets a real BD address.
+  UART is completed" and works once it has a BD address (supplied by hand at
+  the time; now taken from the device tree — see the Bluetooth address
+  section above).
 
 Two follow-ups came out of that boot:
 
@@ -863,6 +906,70 @@ no second graph port, so one kernel boots either wiring:
 
 `./set-panel-link-mode.sh single|dual` installs either one into both
 GRUB-referenced DTB paths.
+
+## Video decode: the hardware is IRIS1, and mainline has no driver for it yet
+
+The SC8180X video accelerator is a **Venus/IRIS VPU**.  What exists today:
+
+* the kernel has `CONFIG_VIDEO_QCOM_VENUS=m` and the `venus` module builds;
+* VIDEOCC is already upstream for this SoC (`videocc-sc8180x` on
+  `qcom,sm8150-videocc`, with `VENUS_GDSC`, `VCODEC0_GDSC`, `VCODEC1_GDSC`
+  and the IRIS core clocks), and `gcc-sc8180x` has the Venus reset with the
+  right delay;
+* `linux-firmware` carries several candidates, but none is the one Windows
+  uses (`qcom/vpu-1.0/venus.mbn` is `VIDEO.VPU.1.0-00119`, `vpu20_p1.mbn` is
+  `video-firmware.1.0-ed457c1`, `venus-5.4/venus.mbn` is `VIDEO.VE.5.4`);
+* neither `sc8180x.dtsi` nor mainline has a video-codec node, and the ACPI
+  tables do not describe the block at all.
+
+### What the Windows install proves
+
+The Windows partition is still on the NVMe.  Its SYSTEM registry hive has a
+`VENUS` subsystem service (`VENUS_QCOM_DEVICE_0`, next to the ADSP/SLPI/CDSP/
+WPSS subsystems), the driver package is `qcdx8180`, and the video firmware it
+ships is `qcvss8180.mbn`, whose build string is:
+
+```
+QC_IMAGE_VERSION_STRING=VIDEO.IR.1.2-00042-PROD-1
+```
+
+`IR.1.2` means the **IRIS1** generation (the `VIDEO.VE.*` strings are the
+older AR50 `venus-*` firmware, `VIDEO.VPU.*` the IRIS2 one).  So this board is
+IRIS1 with the Gen1 HFI, which also matches its SM8150 era.
+
+### Why it cannot work today
+
+The upstream `venus` driver (this tree, 6.18) stops at `sm8250` and has no
+platform data for SM8150/SC8180X.  The `iris` driver, which is the one with
+the IRIS1 Gen1 code path (`iris_platform_sm8250.c`), only matches
+`qcs8300`, `sm8250`, `sm8550`, `sm8650` and `sm8750`.  There is no upstream
+platform data for this SoC in either driver, and no matching firmware in
+`linux-firmware`.
+
+### The probe attempt in this tree (branch `xiaomi-mainline-panel2`)
+
+`613d5b87508e` adds a video-codec node to `sc8180x.dtsi`
+(`0xaa00000`, SPI 174, `apps_smmu` stream `0x2100 0x0400`, the videocc GDSCs
+and IRIS clocks, two NOC paths), enables it for the board and adds an
+`sc8180x` entry to the **venus** driver using the SM8250 tables with the
+IRIS2/HFI-6XX assumption.  That assumption is now known to be wrong (the
+hardware is IRIS1), so the entry is a probe vehicle only: its only purpose is
+to find out whether the block is where the sm8250/sc7180 layout suggests and
+what the probe reports.
+
+The next step, if this is ever picked up again, is not the venus driver but:
+
+1. a `sc8180x_data` entry in `iris_platform_sm8250.c`-style code: Gen1 HFI
+   (`iris_hfi_gen1_*`), `vpu_ops = &iris_vpu2_ops`, the videocc clock names
+   already in this device tree, `fwname = "qcom/vpu-1.0/venus.mbn"`;
+2. `CONFIG_VIDEO_QCOM_IRIS=m` (it is off today) and the matching compatible
+   in the device tree;
+3. firmware: the Windows `qcvss8180.mbn` is signed for the Windows PIL path
+   and is not a drop-in for `linux-firmware`; a matching IRIS1 firmware for
+   SC8180X has to be sourced from a vendor/Android image.
+
+None of that is a one-evening job, and even then userspace has no VA-API
+driver for this VPU.
 
 ## Build note
 
