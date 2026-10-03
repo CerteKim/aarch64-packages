@@ -245,15 +245,29 @@ sensors to report. Upstream hit the same wall on the Yoga C630 — Baryshkov's
 patch enabling `slpi_pas` there notes the DSP "provides QMI services, however
 it is of limited functionality due to the missing `fastrpc_shell_1` binary".
 
-So what is left is the FastRPC chain, and none of it is DT-free work:
+All three pieces of the FastRPC chain were then found or built, from the
+Windows driver store on `nvme0n1p3` (mount it read-only to look):
 
-1. a `fastrpc` node under the SLPI's `glink-edge` — `sc8180x.dtsi` has none
-   for any DSP, and the SMMU stream IDs for this SoC are not known from any
-   source on hand;
-2. `hexagonrpcd` in userspace — not in the Arch repos, so it has to be built;
-3. the sensor JSON configs for this device, plus the FastRPC shell binary,
-   both presumably in the Windows driver store (the partition was unmounted
-   before this could be checked).
+1. a `fastrpc` node under the SLPI's `glink-edge`, labelled `sdsp` — added,
+   giving `/dev/fastrpc-sdsp`. Its SMMU stream IDs are SM8150's, which is the
+   one unconfirmed value in the whole chain;
+2. `hexagonrpcd` from `github.com/linux-msm/hexagonrpc` (v0.5.0) — builds
+   with meson; note its sdsp unit runs `-f /dev/fastrpc-sdsp -d sdsp -s` and
+   needs **no** `fastrpc_shell_1` (that binary genuinely is not on the Windows
+   install — only `ADSP/fastrpc_shell_0` and `CDSP/fastrpc_shell_3` are);
+3. the sensor configs, in `qcsensorsconfigcls8180.inf_arm64_0a6924f604d585ff`.
+   The device is platform `CLS` and its own `config_list.txt` names the files
+   to use; `sscregistrygen -p CLS -s 340 <configs> <out>` turns them into the
+   registry hexagonrpcd serves. That registry names the real sensors:
+   **`icm4x6xx`** (6-axis IMU — this is the accelerometer), `stk3a5x`
+   (ambient light + proximity) and `ak0991x` (magnetometer).
+
+Note `-s 340`: the configs declare `soc_id` 340 while the kernel reports
+`/sys/devices/soc0/soc_id` as **404**, and filtering on 404 yields an empty
+registry. Whether the SSC cares about that mismatch is not yet known.
+
+Install staged at `~/qcom-slpi/install.sh` (hexagonrpcd, the configs, the
+registry, a systemd override passing `-R /usr/share/qcom/sc8180x/XIAOMI/BOOK124`).
 
 ## Not achievable with reasonable effort
 
