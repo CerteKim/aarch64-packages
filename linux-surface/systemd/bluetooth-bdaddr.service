@@ -1,0 +1,17 @@
+[Unit]
+Description=Set the WCN3998 Bluetooth BD address
+Documentation=file:///home/certe/aarch64-packages/linux-surface/systemd/bluetooth-bdaddr.sh
+# The controller only exists once bluetoothd has attached and powered it up
+# enough for the kernel to see hci0, but the address has to be in place before
+# bluetoothd actually uses the controller.
+After=bluetooth.service
+Wants=bluetooth.service
+ConditionPathIsDirectory=/sys/class/bluetooth
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/bluetooth-bdaddr.sh
+
+[Install]
+WantedBy=bluetooth.target
