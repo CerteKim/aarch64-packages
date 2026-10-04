@@ -1872,14 +1872,33 @@ overclocked one and the Advanced entry the stock one.  Because the two names no
 longer hold the same file, `set-panel-link-mode.sh` and
 `install-mainline-panel.sh` now only write the stock path.
 
+### Speed bin or profile?
+
+These are **firmware-advertised profiles, not an over-bin**: the tables are
+ACPI `PMCL` capability lists in `Device (MON0)` (`Method (PMCL)`), i.e. sets the
+OS is offered and selects from, and the DSDT contains no speed-bin/GCN fuse
+value at all (it would be a `speed_bin` nvmem cell in the DT).  There is no such
+cell here, so `a6xx_set_supported_hw()` gets `-ENOENT`, applies no
+`opp-supported-hw` gating, and every declared OPP is available — which is also
+why `dmesg` has no speed-bin warning.  Windows on this machine picks the 670 MHz
+set; the OC device tree simply declares the same states to the GMU.
+
 ### Verify
 
-    grep . /sys/class/devfreq/2c00000.gpu/available_frequencies
+`tools/gpu-oc-check.sh` reports it in one go — the booted DTB hashes, the
+devfreq table, which of the three states are present, the log's GPU errors, and
+(with `-- <command>`) the peak `cur_freq` while a workload runs:
 
-should list `530000000 595000000 670000000` in addition to the stock set, and a
-GPU load (`glmark2`, `vkmark`) should clock up to 670 MHz.  Watch
-`dmesg | grep -iE "gpu|adreno"` for faults; the way back is to delete the three
-OPPs and rebuild.
+    tools/gpu-oc-check.sh
+    tools/gpu-oc-check.sh -- vulkaninfo --summary   # any GPU load works
+
+It exits 2 when the booted tree is the stock one and prints the install line.
+Expected once the `-oc` DTB is booted:
+
+    available_frequencies: 177000000 256000000 315000000 405000000 461000000 \
+                           500000000 514000000 530000000 595000000 670000000
+
+The way back is to delete the three OPPs and rebuild.
 
 ## Build note
 
