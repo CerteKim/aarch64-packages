@@ -970,6 +970,30 @@ for IRIS1:
   `iris_platform_sm8250.o` when venus is *not* selected, and no sc8180x board
   uses the venus driver.
 
+### The real blocker was the VIDEOCC driver, not the video driver
+
+Probing the decoder on hardware showed the device never even reached a driver:
+
+```
+aa00000.video-codec: waiting_for_supplier
+ab00000.clock-controller: waiting_for_supplier, no driver bound
+```
+
+The video codec's clocks and its `VENUS_GDSC`/`VCODEC0_GDSC` power domains all
+live in VIDEOCC, so with no driver on `ab00000.clock-controller` the codec can
+never probe.  Two separate holes caused that:
+
+* `drivers/clk/qcom/videocc-sm8150.c` only matched `qcom,sm8150-videocc`,
+  while the device tree node has
+  `compatible = "qcom,sc8180x-videocc", "qcom,sm8150-videocc"` — the DT half
+  of that upstream series landed, the driver half did not (fixed here);
+* `CONFIG_SM_VIDEOCC_8150` was not set at all, so the driver was not even
+  built.
+
+With both fixed, the expected chain is VIDEOCC binds -> codec gets its clocks
+and GDSCs -> iris probes -> and only then does the missing IRIS1 firmware
+become the next wall.
+
 The device-tree side has been checked as far as software can take it:
 
 * `0xaa00000` overlaps nothing in the SC8180X memory map (camera ends at

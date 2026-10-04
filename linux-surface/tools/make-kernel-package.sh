@@ -21,7 +21,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KVER="$(make -s -C "$KSRC" ARCH=arm64 kernelrelease)"
 STAGE="$(mktemp -d /home/certe/pkgstage-XXXXXX)/linux-mibook"
 M="$STAGE/usr/lib/modules/${KVER}"
-PKG="$REPO/linux-mibook-${KVER%-*}-${PKGREL}-aarch64.pkg.tar.zst"
+PKG="$REPO/linux-mibook-6.18.2-1-${PKGREL}-aarch64.pkg.tar.zst"
 DTB="sc8180x-xiaomi-book-12.4.dtb"
 
 echo "==> kernel release: ${KVER}"
@@ -75,7 +75,7 @@ SIZE=$(du -sb "$STAGE" | cut -f1)
 cat > "$STAGE/.PKGINFO" <<EOF
 pkgname = linux-mibook
 pkgbase = linux-mibook
-pkgver = ${KVER%-*}-${PKGREL}
+pkgver = 6.18.2-1
 pkgdesc = Linux Xiaomi Book S 12.4 kernel and modules
 url = https://github.com/CerteKim/linux-a51
 builddate = $(date +%s)

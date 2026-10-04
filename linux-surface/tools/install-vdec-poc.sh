@@ -4,7 +4,7 @@
 set -euo pipefail
 REPO=/home/certe/aarch64-packages/linux-surface
 K=$REPO/src/kernel
-PKG=$REPO/linux-mibook-6.18.2-3-aarch64.pkg.tar.zst
+PKG=$REPO/linux-mibook-6.18.2-1-4-aarch64.pkg.tar.zst
 
 echo "==> installing $PKG"
 pacman -U --noconfirm "$PKG"
