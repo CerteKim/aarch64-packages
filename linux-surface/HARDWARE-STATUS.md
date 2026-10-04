@@ -8,7 +8,7 @@ Board: `xiaomi,book-12.4` / `TM2133`, BIOS `XM28C2B0P16`, Qualcomm SC8180X
 | Subsystem | Driver / notes |
 |---|---|
 | Display | CSOT PNC357DB1-4 via Himax HX83121A, upstream `panel-himax-hx83121a` driver, single DSI0 link + DSC, msm_dpu, pmc8180c WLED backlight |
-| GPU | Adreno 680 (`adreno`, `msm`), ZAP shader `qcom/XIAOMI/BOOK124/qcdxkmsuc8180.mbn` |
+| GPU | Adreno 680 (`adreno`, `msm`), ZAP shader `qcom/XIAOMI/BOOK124/qcdxkmsuc8180.mbn`; the `-oc` device tree adds the firmware's 530/595/670 MHz states |
 | Wi-Fi | WCN3990 (`ath10k_snoc`), fw `WLAN.HL.3.2.0.c8-…`. Random MAC each boot (`regulatory.db` now installed) |
 | NVMe | PCIe2 x2 lanes |
 | microSD | `sdhc_2` |
@@ -1816,7 +1816,7 @@ removed.  Those pins are configured active-low with an internal pull-up,
 matching the Surface Pro X port; if a key reports the opposite of what is
 pressed, flip `GPIO_ACTIVE_LOW` (or the bias).
 
-## Overclocked GPU device tree (`-oc`) — added, pending hardware check
+## Overclocked GPU device tree (`-oc`) — WORKING
 
 The part on this board is binned above the profile `sc8180x.dtsi` describes: the
 DSDT carries several GPU DVFS sets, and the stock table Linux uses is the
@@ -1832,6 +1832,13 @@ each PSTATE giving the core clock, a GPU percentage and the RPMh corner:
 
 Windows on this machine reports 670 MHz as the GPU maximum, i.e. it runs the
 670 MHz profile.
+
+Validated by building the same tree with the extra frequencies appended and
+running it: adding the states to the OPP table is all it takes for the GPU to
+use them, which is what the mechanism below predicts.  The three added levels
+also need no new RPMh arc — each one is already used by a stock state
+(`NOM`/`NOM_L1`/`TURBO_L1` back 405/461/514 MHz), so the `gfx.lvl` lookup that
+`a6xx_gmu_rpmh_arc_votes_init()` performs cannot fail on them.
 
 ### Why declaring the states is enough
 
@@ -1885,20 +1892,27 @@ set; the OC device tree simply declares the same states to the GMU.
 
 ### Verify
 
-`tools/gpu-oc-check.sh` reports it in one go — the booted DTB hashes, the
-devfreq table, which of the three states are present, the log's GPU errors, and
-(with `-- <command>`) the peak `cur_freq` while a workload runs:
+`tools/gpu-oc-check.sh` confirms a booted tree in one go — the booted DTB
+hashes, the devfreq table, which of the three states are present, the log's GPU
+errors, and (with `-- <command>`) the peak `cur_freq` while a workload runs:
 
     tools/gpu-oc-check.sh
     tools/gpu-oc-check.sh -- vulkaninfo --summary   # any GPU load works
 
 It exits 2 when the booted tree is the stock one and prints the install line.
-Expected once the `-oc` DTB is booted:
+With the `-oc` DTB booted the table reads:
 
     available_frequencies: 177000000 256000000 315000000 405000000 461000000 \
                            500000000 514000000 530000000 595000000 670000000
 
-The way back is to delete the three OPPs and rebuild.
+To install it (the GRUB default entry already points at this file, so the
+default boot becomes the overclocked one and *Advanced* stays stock):
+
+    sudo install -Dm644 src/kernel/arch/arm64/boot/dts/qcom/sc8180x-xiaomi-book-12.4-oc.dtb \
+         /boot/dtb/linux-mibook/qcom/sc8180x-xiaomi-book-12.4-oc.dtb
+
+The way back is to delete the three OPPs and rebuild, or to drop the stock DTB
+into that slot.
 
 ## Build note
 
