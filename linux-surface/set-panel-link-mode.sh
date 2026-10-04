@@ -7,9 +7,9 @@
 #   sudo ./set-panel-link-mode.sh dual
 #   sudo ./set-panel-link-mode.sh --status
 #
-# These prebuilt panel DTBs only go to the stock path: the "-oc" name is the
-# overclocked GPU device tree built from sc8180x-xiaomi-book-12.4-oc.dts, and
-# is installed by tools/refresh-boot-from-tree.sh rather than overwritten here.
+# These prebuilt panel DTBs only go to the stock path; the "-oc" name is a copy
+# of the same tree used by the default GRUB menu entry, so install the built
+# DTB into both names with tools/refresh-boot-from-tree.sh after switching.
 # Note also that panel-dtb/*.dtb are snapshots from before the power-key,
 # volume-key and backlight work, so a build from the source tree is preferable.
 set -euo pipefail

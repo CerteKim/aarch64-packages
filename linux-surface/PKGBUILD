@@ -7,17 +7,16 @@ pkgver="6.18.2"
 pkgrel="1"
 
 _pkgdesc="Linux Xiaomi Book S 12.4"
-_dtbs=("qcom/sc8180x-xiaomi-book-12.4.dtb"
-       "qcom/sc8180x-xiaomi-book-12.4-oc.dtb")
+_dtbs=("qcom/sc8180x-xiaomi-book-12.4.dtb")
 
 arch=("aarch64")
 options=("!strip")
 makedepends=('xmlto' 'docbook-xsl' 'kmod' 'inetutils' 'bc' 'git' 'dtc')
 
-# 5a2c310 is the panel-backlight fix (branch xiaomi-panel-backlight in the
-# local mirror): it sits directly on top of the panel branch tip so that the
-# build picks up the LPG-PWM backlight without the unpushed video/IRIS WIP.
-_ref_ksource="5a2c310b4d8499f1df1e091efa8148bc7be5ec50"
+# 5788790 is the tip of xiaomi-mainline-panel2 in the local mirror: it carries
+# the LPG-PWM backlight, the power key, the volume keys (PMIC GPIO + PON RESIN)
+# and the higher GPU DVFS states of this part.
+_ref_ksource="5788790523d50d644b765c5702f7c2df60d79fc7"
 _ref_config_base="e36ada85974d22c05d1442a4ac47f958c7fa8e15"
 
 # The branch with the mainline panel driver is not pushed to GitHub yet, so the
@@ -106,6 +105,21 @@ _package() {
         install -Dm644 "arch/arm64/boot/dts/${dtb}" "${modulesdir}/dtb/${dtb}"
     done
     mkdir -p "${pkgdir}/boot/dtb/${pkgbase}" && cp -r "${modulesdir}/dtb/." "${pkgdir}/boot/dtb/${pkgbase}/"
+
+    # The stock device tree goes to every GRUB-referenced name: the default
+    # menu entry boots "-oc.dtb" and the Advanced entry the plain name.  They
+    # are the same tree — the higher GPU states of this part live in
+    # sc8180x-xiaomi-book-12.4.dtsi now, not in a separate variant.
+    local qdir="${pkgdir}/boot/dtb/${pkgbase}/qcom"
+    install -Dm644 "${qdir}/sc8180x-xiaomi-book-12.4.dtb" \
+        "${qdir}/sc8180x-xiaomi-book-12.4-oc.dtb"
+
+    # Probe variant for the video work: same tree, VPU node enabled.  Nothing
+    # references it until tools/probe-vdec-run.sh installs it.
+    install -Dm644 "${qdir}/sc8180x-xiaomi-book-12.4.dtb" \
+        "${qdir}/sc8180x-xiaomi-book-12.4-vdec-probe.dtb"
+    fdtput -ts "${qdir}/sc8180x-xiaomi-book-12.4-vdec-probe.dtb" \
+        /soc@0/video-codec@aa00000 status okay
 
     msg2 "Installing mkinitcpio preset..."
 

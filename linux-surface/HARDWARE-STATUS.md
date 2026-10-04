@@ -1816,7 +1816,7 @@ removed.  Those pins are configured active-low with an internal pull-up,
 matching the Surface Pro X port; if a key reports the opposite of what is
 pressed, flip `GPIO_ACTIVE_LOW` (or the bias).
 
-## Overclocked GPU device tree (`-oc`) — WORKING
+## GPU DVFS: the higher states this part advertises — WORKING
 
 The part on this board is binned above the profile `sc8180x.dtsi` describes: the
 DSDT carries several GPU DVFS sets, and the stock table Linux uses is the
@@ -1856,13 +1856,8 @@ DVFS level; nothing else needs to change.
 
 ### What is in the tree
 
-`sc8180x-xiaomi-book-12.4.dts` was split into `sc8180x-xiaomi-book-12.4.dtsi`
-(the board) plus two wrappers, so the variant can share it:
-
-* `sc8180x-xiaomi-book-12.4.dts` — stock.  Verified byte-identical to the DTB
-  built before the split;
-* `sc8180x-xiaomi-book-12.4-oc.dts` — adds the three states missing from the
-  stock table:
+The board content lives in `sc8180x-xiaomi-book-12.4.dtsi`, which now carries
+the three extra states itself — there is no separate variant any more:
 
 | state | `opp-level` |
 | --- | --- |
@@ -1870,14 +1865,19 @@ DVFS level; nothing else needs to change.
 | 595 MHz | `RPMH_REGULATOR_LEVEL_NOM_L1` (`0x140`) |
 | 670 MHz | `RPMH_REGULATOR_LEVEL_TURBO_L1` (`0x1a0`) |
 
-625 MHz (`TURBO`) and 718 MHz (`TURBO_L2`) are deliberately left out.
+625 MHz (`TURBO`) and 718 MHz (`TURBO_L2`) are deliberately left out.  Folding
+them into the board file produced a DTB byte-identical to the earlier
+`-oc` variant build, so this is exactly the same device tree the default entry
+used to boot.
 
-Both are build targets now (the qcom `Makefile` gained the `-oc` entry and the
-PKGBUILD ships both), so the `-oc` filename finally means something: the GRUB
-default entry already pointed at it, which makes the default boot the
-overclocked one and the Advanced entry the stock one.  Because the two names no
-longer hold the same file, `set-panel-link-mode.sh` and
-`install-mainline-panel.sh` now only write the stock path.
+`sc8180x-xiaomi-book-12.4.dts` is a thin wrapper for it, and the package installs
+that one DTB under every name GRUB references —
+`sc8180x-xiaomi-book-12.4.dtb` (Advanced / SD-card entries) and
+`sc8180x-xiaomi-book-12.4-oc.dtb` (the default entry), plus a
+`-vdec-probe.dtb` copy with the VPU node enabled for the video work.  So
+whatever entry is picked, the GPU gets the full set; `set-panel-link-mode.sh`
+and `install-mainline-panel.sh` still only write the stock path because their
+prebuilt panel DTBs predate all of this.
 
 ### Speed bin or profile?
 
@@ -1888,7 +1888,7 @@ value at all (it would be a `speed_bin` nvmem cell in the DT).  There is no such
 cell here, so `a6xx_set_supported_hw()` gets `-ENOENT`, applies no
 `opp-supported-hw` gating, and every declared OPP is available — which is also
 why `dmesg` has no speed-bin warning.  Windows on this machine picks the 670 MHz
-set; the OC device tree simply declares the same states to the GMU.
+set; the board device tree simply declares the same states to the GMU.
 
 ### Verify
 
@@ -1905,14 +1905,16 @@ With the `-oc` DTB booted the table reads:
     available_frequencies: 177000000 256000000 315000000 405000000 461000000 \
                            500000000 514000000 530000000 595000000 670000000
 
-To install it (the GRUB default entry already points at this file, so the
-default boot becomes the overclocked one and *Advanced* stays stock):
+To install it, package the built tree (`tools/make-kernel-package.sh 10`,
+which needs no source clone and installs the one DTB under every GRUB name) and
+`sudo pacman -U` the result, or copy the DTB by hand into both names:
 
-    sudo install -Dm644 src/kernel/arch/arm64/boot/dts/qcom/sc8180x-xiaomi-book-12.4-oc.dtb \
-         /boot/dtb/linux-mibook/qcom/sc8180x-xiaomi-book-12.4-oc.dtb
+    D=/boot/dtb/linux-mibook/qcom
+    sudo install -Dm644 src/kernel/arch/arm64/boot/dts/qcom/sc8180x-xiaomi-book-12.4.dtb $D/sc8180x-xiaomi-book-12.4.dtb
+    sudo install -Dm644 src/kernel/arch/arm64/boot/dts/qcom/sc8180x-xiaomi-book-12.4.dtb $D/sc8180x-xiaomi-book-12.4-oc.dtb
 
-The way back is to delete the three OPPs and rebuild, or to drop the stock DTB
-into that slot.
+The way back is to delete the three OPPs and rebuild, or to drop a stock DTB
+into those slots.
 
 ## Build note
 
