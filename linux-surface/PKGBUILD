@@ -13,7 +13,10 @@ arch=("aarch64")
 options=("!strip")
 makedepends=('xmlto' 'docbook-xsl' 'kmod' 'inetutils' 'bc' 'git' 'dtc')
 
-_ref_ksource="cb8e5e30be33f0694d1a9501f09dc276eac0097a"
+# 5a2c310 is the panel-backlight fix (branch xiaomi-panel-backlight in the
+# local mirror): it sits directly on top of the panel branch tip so that the
+# build picks up the LPG-PWM backlight without the unpushed video/IRIS WIP.
+_ref_ksource="5a2c310b4d8499f1df1e091efa8148bc7be5ec50"
 _ref_config_base="e36ada85974d22c05d1442a4ac47f958c7fa8e15"
 
 # The branch with the mainline panel driver is not pushed to GitHub yet, so the
