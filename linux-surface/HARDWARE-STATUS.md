@@ -990,9 +990,20 @@ never probe.  Two separate holes caused that:
 * `CONFIG_SM_VIDEOCC_8150` was not set at all, so the driver was not even
   built.
 
-With both fixed, the expected chain is VIDEOCC binds -> codec gets its clocks
-and GDSCs -> iris probes -> and only then does the missing IRIS1 firmware
-become the next wall.
+With both fixed, the chain did exactly that on hardware: `ab00000.clock-controller`
+bound to `video_cc-sm8150`, `aa00000.video-codec` bound to `qcom-iris`, and the
+iris driver reached its power-on step.  It then failed on one more device tree
+detail:
+
+```
+qcom-iris aa00000.video-codec: dev_pm_opp_set_rate: failed to find OPP for freq 533000000 (-34)
+qcom-iris aa00000.video-codec: power on failed
+qcom-iris aa00000.video-codec: core init failed
+```
+
+`ftbl_video_cc_iris_clk_src` offers up to 533 MHz and the OPP table only went to
+444 MHz, so the highest rate had no OPP; 365 MHz was missing as well.  Both are
+added.
 
 The device-tree side has been checked as far as software can take it:
 
