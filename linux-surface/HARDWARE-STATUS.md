@@ -1760,48 +1760,61 @@ Interpretation:
 * `level devices`/`platform` hangs — a driver, named by the last line of the
   verbose dpm log (`pm_debug_messages=1`).
 
-## Volume keys — the ACPI0011 gap (probe in progress)
+## Volume keys — wired from ACPI (volume up working)
 
 The volume keys are described **only** in ACPI, by the Generic Buttons device
 (`\_SB.BTNS`, `_HID ACPI0011`) that Linux has no driver for — the vendor device
-tree does not mention them, and neither do the upstream SC8180X boards.  The
-description is:
+tree does not mention them, and neither do the upstream SC8180X boards:
 
 | `_CRS` GpioInt on `\_SB.PM01` | flags | `_DSD` usage | key |
 | --- | --- | --- | --- |
+| pin `0x0000` | ActiveBoth, ExclusiveAndWake, PullDown | page `0x01`, `0x81` | KPDPWR (power) |
 | pin `0x0001` | ActiveBoth, Exclusive, PullDown | page `0x0C`, `0xEA` | Volume Down |
 | pin `0x0085` | ActiveBoth, Exclusive, PullUp | page `0x0C`, `0xE9` | Volume Up |
-| pin `0x0000` | ActiveBoth, ExclusiveAndWake, PullDown | page `0x01`, `0x81` | (not a key) |
 
-`\_SB.PM01` (`_HID QCOM0430`, `_UID 1`) is the aggregate PMIC GPIO controller:
-one pin space covers the GPIOs of every PMIC, and its stride is not documented.
+`\_SB.PM01` (`_HID QCOM0430`, `_UID 1`) mixes two number spaces, which is what
+made this take several attempts: plain PMIC interrupts sit below `0x80` (the ADC
+and BCL entries in *both* this machine's dump and the Surface Pro X's are like
+that), while the PMIC GPIOs are `0x7f + gpio`.
 
 The Surface Pro X dump in `aarch64-laptops/build/misc/microsoft-surface-prox`
-cracks it: its own button device (`\_SB.MSBT`, `MSHW0040`) declares the *same*
-three GpioInts on the same controller — `0x00`, `0x80` and `0x85` — and the
+supplies the second half: its own button device (`\_SB.MSBT`, `MSHW0040`)
+declares the same `0x00`/`0x80`/`0x85` triple on the same controller, and the
 linux-surface Surface Pro X port (`4bc1a33`, "surface-prox: Add support for
-volume buttons") maps its two volume keys to **GPIO 1 and GPIO 6 of the first
-PMIC**.  That fits a `0x7f + gpio` offset exactly (`0x7f + 1 = 0x80`,
-`0x7f + 6 = 0x85`), and `0x85` is the pin both machines share, so volume-up is
-the first PMIC's **GPIO 6**.  The board DTS therefore carries:
+volume buttons") drives its volume keys from the first PMIC's **GPIO 1 and
+GPIO 6** — i.e. `0x80` and `0x85`.  Reading the three pins that way:
 
-| key | declared | first reading tried |
+| pin | is | Linux |
 | --- | --- | --- |
-| Volume Down | `pmc8180_1_gpios 1` | pin `0x0001` → first PMIC GPIO 1 |
-| Volume Up | `pmc8180_1_gpios 6` | pin `0x0085` → `0x7f + 6` (Surface Pro X match) |
-| Volume Up (alt) | `pmc8180_1_gpios 5` | pin `0x0085` → `0x80 + 5` |
+| `0x0000` | PON KPDPWR | `&pmc8180_pwrkey` — the power key already enabled |
+| `0x0001` | PON RESIN | `&pmc8180_resin`, `linux,code = <KEY_VOLUMEDOWN>` |
+| `0x0085` | first PMIC GPIO 6 | `gpio-keys`, `linux,code = <KEY_VOLUMEUP>` |
 
-Both volume-up readings are instantiated so that whichever fires identifies the
-offset; the other one is then removed.  Each is its own input device, so
-`evtest`'s device name ("Volume Up (pmc8180_1 gpio6)") says which one fired.
+Volume up was verified on hardware 2026-10-04.  Volume down needs RESIN, which
+`sc8180x-pmics.dtsi` never declared at all (upstream `pm8150.dtsi` has it, and
+the Surface Duo enables it for exactly this key):
 
-The pins are configured active-low with an internal pull-up, matching the
-Surface Pro X port; if a key reports the opposite of what is pressed, flip
-`GPIO_ACTIVE_LOW` (or the bias).
+    pmc8180_resin: resin {
+            compatible = "qcom,pm8941-resin";
+            interrupts = <0x0 0x8 0x1 IRQ_TYPE_EDGE_BOTH>;
+            debounce = <15625>;
+            bias-pull-up;
+            status = "disabled";        /* enabled by the board */
+    };
 
-Note that `evtest` reporting no events can mean two different things, so check
-`dmesg | grep -iE "gpio-keys|gpio_keys"` first: no events from a device that did
-exist is a wrong pin, while no device at all is a failed GPIO/IRQ claim.
+    &pmc8180_resin {
+            status = "okay";
+            linux,code = <KEY_VOLUMEDOWN>;
+    };
+
+`qcom-pon` populates the PON children (`devm_of_platform_populate()`), so the
+resin probes exactly the way the power key does.
+
+Two readings of `0x85` (`0x7f + 6` and `0x80 + 5`) are still instantiated as
+separate volume-up input devices; once the firing one is known the other is
+removed.  Those pins are configured active-low with an internal pull-up,
+matching the Surface Pro X port; if a key reports the opposite of what is
+pressed, flip `GPIO_ACTIVE_LOW` (or the bias).
 
 ## Build note
 
