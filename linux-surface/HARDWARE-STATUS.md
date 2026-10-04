@@ -1033,6 +1033,42 @@ What is still missing before a decoder can work:
    `/dev/video0` would only be usable through a V4L2 stateful decoder path
    (for example ffmpeg's `v4l2` hwaccel), not through the browser stack.
 
+### Outcome: parked, with the video node disabled
+
+The probe answered everything it could and then had to be stopped:
+
+* the device tree side is fully correct — VIDEOCC binds, `aa00000.video-codec`
+  binds to the iris driver, the OPP table is complete;
+* the iris driver gets as far as powering the VPU on, and that is where the
+  machine dies: with no firmware the VPU does not answer the boot-handshake
+  registers, all four boot attempts stalled ~27 s in with
+  `rcu_preempt detected stalls`, and the traces only show victims blocked on
+  mm locks (no iris frame survives).
+
+So the video-codec node is now `disabled` in `sc8180x.dtsi` — the node and its
+full resource set stay in the tree as a reference, but nothing probes the
+hardware.  Three real upstream bugs found on the way are kept:
+
+1. `videocc-sm8150.c` did not match `qcom,sc8180x-videocc`, so the VIDEOCC
+   node (added to this device tree by an upstream series whose driver half
+   never landed) had no driver at all;
+2. `CONFIG_SM_VIDEOCC_8150` was not set, so that driver was not even built;
+3. the video OPP table was missing the clock's own top rates (533 MHz and
+   365 MHz), which is what the first successful probe tripped over.
+
+What a future attempt needs, in order:
+
+1. an IRIS1 firmware for SC8180X (the Windows one is `VIDEO.IR.1.2` and is
+   signed for the Windows PIL path; nothing in `linux-firmware` carries an
+   `IR.1.x` version string);
+2. a way to power the VPU on without wedging the machine when the firmware is
+   absent — upstream `iris` polls the VPU registers right after power-on;
+3. userspace support (no VA-API driver exists for this VPU).
+
+To re-enable the experiment later: add `&venus { status = "okay"; };` to the
+board device tree, build, and be ready to boot the previous kernel if the
+firmware is still missing.
+
 ## Build note
 
 `tools/lib/bpf/libbpf.c` needs explicit `(char *)` casts on `strstr()`/`strchr()`
