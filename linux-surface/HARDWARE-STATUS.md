@@ -737,9 +737,14 @@ desktop file (or the script) to go back to running the recipe by hand.
 * Wi-Fi random MAC — the WLAN NV holds no per-unit MAC; set one statically.
   Confirmed still open: three consecutive boots gave three different addresses
   with `ath10k_snoc: invalid MAC address; choosing random`.
-* Watchdog — `qcom-wdt` is built, but this kernel's driver has no SC8180X
-  compatible, so a DT node alone is not enough.
-* QCE crypto — driver present (`qcom,qce`), no DT node; register layout unknown.
+* Watchdog — stale as written: the binding already lists
+  `qcom,apss-wdt-sc8180x`, and `qcom-wdt` matches the generic `qcom,kpss-wdt`
+  fallback, so a node with `"qcom,apss-wdt-sc8180x", "qcom,kpss-wdt"` binds
+  today.  Template: `sm8150.dtsi`'s node (`0x17c10000`, `sleep_clk`,
+  `GIC_SPI 0`), not sc7180's.
+* QCE crypto — driver present (`qcom,qce`), no DT node.  The register layout
+  and the SMMU SIDs are available from the SM8150 sibling: `crypto@1dfa000`,
+  `"qcom,sm8150-qce", "qcom,qce"`, cryptobam dmas plus five stream IDs.
 * BAM parameters — the DT copies SDM845's `num-channels`/`num-ees`; the
   community SC8180X tree uses `num-channels = <31>`, `qcom,num-ees = <2>`,
   `reg` size `0x2c000`. Enumeration is a bus-level operation, so this is
@@ -1568,6 +1573,177 @@ sources), write the HFI-version register, then `CTRL_INIT`.
   *survivable* oops, unlike a bus stall, which is a hard lock;
 * a user-mode `/dev/mem` read of an unmapped VPU register can take the machine
   down, while the same access from kernel context is an oops.
+
+### Sixth round: SM8150 / Xiaomi Pad 5 (`nabu`) is the right reference, and it names the recipe
+
+Checked 2026-10-04.  The Gen1 work was referenced against SM8250/SM8350/
+SC8280XP (the only in-tree Gen1 path) and against the vendor SC8180X device
+tree.  The correct family to compare against is **SM8150**: the Xiaomi Pad 5
+(`nabu`, Snapdragon 855/860) is the same silicon generation, and its vendor
+tree is public.
+
+Mainline has *no* SM8150 video support — `venus` stops at
+`sdm845`/`sc7180`/`sc7280`/`sm8250`, `iris` has no SM8150 entry, and
+`sm8150.dtsi` has no video node — so the useful artefact is the downstream
+tree (`MiCode/Xiaomi_Kernel_OpenSource`, branch `nabu-r-oss`; mirrored as
+`crdroidandroid/android_kernel_xiaomi_sm8150`, read at `d43213ae`).
+
+#### What it confirms
+
+| Fact | SC8180X (this tree) | SM8150 vendor (`sm8150-vidc.dtsi`) |
+| --- | --- | --- |
+| node base / window | `0xaa00000`, 1 MB (the vendor 2 MB overlaps VIDEOCC) | `0xaa00000`, 2 MB — the same overlap with VIDEOCC at `0xab00000` |
+| clocks | `gcc_video_axic`, `axi0`, `axi1`, `VIDEO_CC_MVSC/MVS0/MVS1_CORE` | identical six |
+| resets | `GCC_VIDEO_AXIC_CLK_BCR`, `VIDEO_CC_MVSC_CORE_CLK_BCR`, `GCC_VIDEO_AXI0_CLK_BCR`, `GCC_VIDEO_AXI1_CLK_BCR` | identical four |
+| non-secure SID | `0x1300 0x60` | `0x1300 0x60` |
+| firmware region | `video_mem`, 5 MB | `VENUS_REGION_SIZE` = `0x00500000` |
+
+The same file supplies the **secure context banks**, which this project had no
+numbers for.  They line up with the DSDT manifest's four pagetable sets
+(`VideoNonSecurePT` + `VideoSecurePT1..4`):
+
+| bank | SID / mask | buffer types |
+| --- | --- | --- |
+| `venus_ns` | `0x1300 0x60` | `0xfff` |
+| `venus_sec_bitstream` | `0x1301 0x4` | `0x241` |
+| `venus_sec_pixel` | `0x1303 0x20` | `0x106` |
+| `venus_sec_non_pixel` | `0x1304 0x60` | `0x480` |
+
+#### What it changes about the blocker
+
+`venus_boot.c`'s `pil_venus_auth_and_reset()` brings the core up with **no SCM
+PIL call at all** — neither `venus_boot.c` nor `venus_hfi.c` contains a single
+`qcom_scm_*`.  It:
+
+1. writes the wrapper firmware window — `WRAPPER_SEC_CPA_START/END`
+   (`0x1020`/`0x1024`) and `WRAPPER_SEC_FW_START/END` (`0x1028`/`0x102C`) —
+   with `0 .. fw_sz`;
+2. attaches the video IOMMU domain and maps the firmware at IOVA 0 to
+   `resources->firmware_base` with `IOMMU_READ|WRITE|PRIV`;
+3. clears `WRAPPER_A9SS_SW_RESET` (`0x3000`) to release the ARM9.
+
+That is the *same* sequence this machine hard-stalls on when Linux writes it —
+the third round established that `0x1020`-`0x1034`, `0x2000`, `0x2010` and
+`0x3000` are TZ's block — and `firmware_base` is a fixed per-SoC physical base.
+On Android the bootloader has already placed the signed image there, which is
+why the vendor kernel needs neither `pas_init_image` nor `pas_mem_setup`.
+
+Two consequences:
+
+* the missing steps are the CPA/FW window programming, the ARM9 release and
+  the IOVA-0 firmware mapping — not the SCM memory call;
+* there is no `share`/`unlock`/XPU string anywhere in the vendor boot path, so
+  the "request to share / unlock subsystem memory" steps read out of
+  `qcpil8180.sys` look like a Windows hypervisor/TREE artefact rather than
+  something the Venus core requires.  (For the record, `QcTrEE8180.sys`
+  exports `MemShareServiceAllocSyscall` /
+  `MemShareServiceSHMBridgeCreateSyscall` — the named implementation of the
+  "share" half, if that path is ever revisited.)
+
+How `nabu` actually decodes is itself a caution: through the downstream
+`msm_vidc` V4L2 driver (pre-M2M, private `PORT_SETTINGS_*` events, no
+`SOURCE_CHANGE`), which is a bring-up reference and not portable code.
+
+#### Limits
+
+* nothing here is mainline — all of it is vendor downstream and has to be
+  rewritten for the iris path;
+* `firmware_base` and the region are per-SoC bootloader values, so SM8150's
+  are a hypothesis for SC8180X; the PAS-id sweeping ban still stands;
+* no help for the cameras — upstream CAMSS has no SM8150 entry either.
+
+Sources: `MiCode/Xiaomi_Kernel_OpenSource` branch `nabu-r-oss`;
+`crdroidandroid/android_kernel_xiaomi_sm8150` at `d43213ae`
+(`arch/arm64/boot/dts/qcom/sm8150-vidc.dtsi`,
+`drivers/media/platform/msm/vidc/venus_boot.c`, `venus_hfi.c`).
+
+## Suspend / s2idle — open
+
+Status: **not working.**  A suspend attempt turns the screen off and the machine
+never comes back; a hard reset is required.  `suspend_stats` reads 0/0 and no
+`PM: suspend entry` line exists anywhere in the retained journal, so the hang has
+never been captured — everything below is from the source, the DT and the vendor
+reference, not from a trace.
+
+### What is already in place
+
+* `mem_sleep` is `s2idle`; `CONFIG_SUSPEND`, `CONFIG_PM_SLEEP`, `CONFIG_CPU_IDLE`,
+  `CONFIG_ARM_PSCI_CPUIDLE`, `CONFIG_QCOM_PDC` and `CONFIG_QCOM_RPMHPD` are set;
+* the `psci` node carries the CPU and cluster power domains plus both vendor
+  `domain-idle-states`, and the running DT has them
+  (`/proc/device-tree/cpus/domain-idle-states/`);
+* TLMM has `wakeup-parent = <&pdc>`;
+* firmware reports PSCI v1.1 in OSI mode.  `SET_SUSPEND_MODE(PC)` is **denied**
+  (`psci: [Firmware Bug]: failed to set PC mode: -3`), so the platform stays in
+  OSI mode and `CPUidle PSCI` builds the OSI topology.
+
+### Cleared against the vendor reference
+
+`sc8180x-xiaomi-book-12.4-oc-reference.dts` (vendor-derived) agrees with the
+upstream DT on every suspend-relevant node, so none of them is a transcription
+error:
+
+| node | vendor reference | this tree |
+| --- | --- | --- |
+| `pdc` ranges | `0x00 0x1e0 0x5e`, `0x5e 0x261 0x1f` | `<0 480 94>, <94 609 31>` |
+| `pdc` reg | one region, `0xb220000` + `0x30000` | identical |
+| cluster idle states | `0x41000044`, `0x4100a344` | identical |
+
+The second `pdc` region that `sm8250`/`sc8280xp` carry (`<0 0x17c000f0 0x60>`) is
+absent from the vendor DT too, and the mainline driver only maps resource 0 — so
+it is not a deviation.
+
+### Bug found: the power key was never enabled
+
+`sc8180x-pmics.dtsi` leaves the PM8150 PON power key `status = "disabled"`, and
+the Xiaomi board DTS never enables it.  Upstream fixed the same omission for the
+other SC8180X devices in `3706bcfbdb8a` ("arm64: dts: qcom: sc8180x: Enable the
+power key") by enabling `&pmc8180_pwrkey` per board.
+
+Consequences here: there is no `KEY_POWER` input device
+(`/proc/bus/input/devices` has no pwrkey), the power key is absent from
+`/sys/class/wakeup/*`, and since `pwrkey_data.wakeup_source_default = true` the
+wakeup registration comes for free once the node is enabled.  In other words
+**the power button cannot wake the machine**, which by itself reproduces
+"screen off, never comes back".
+
+`panel-dtb/sc8180x-xiaomi-book-12.4-oc-pwrkey.dtb` applies the one-line fix at
+runtime (the `pwrkey-enable.dts` overlay merged with `fdtoverlay` onto the
+pristine `-oc` DTB); it is verified to contain `pwrkey { status = "okay" }`.
+
+### Why the usual pm_test ladder cannot localise this
+
+For suspend-to-idle the kernel accepts only `none/freezer/devices/platform`
+(`kernel/power/suspend.c`), and with `TEST_PLATFORM` set `suspend_enter()` jumps
+straight to `Platform_wake` — so `platform` never runs `s2idle_loop()`.  The
+ladder proves the device and noirq/late paths are clean but cannot reach the
+s2idle entry itself (cpuidle -> PSCI OSI -> `cluster_sleep_aoss_sleep`, wakeup
+through the PDC).  Only a real suspend exercises that.
+
+### Recipe
+
+`tools/suspend-test.sh` (root) writes a synced marker log, so after a hard reset
+`ATTEMPT` without `RESUMED` means the kernel never returned:
+
+    sudo install -Dm644 panel-dtb/sc8180x-xiaomi-book-12.4-oc-pwrkey.dtb \
+         /boot/dtb/linux-mibook/qcom/sc8180x-xiaomi-book-12.4-oc.dtb
+    sudo reboot
+    sudo bash tools/suspend-test.sh prep
+    sudo bash tools/suspend-test.sh level devices     # dpm_suspend/resume only
+    sudo bash tools/suspend-test.sh level platform    # adds noirq + late prepare
+    sudo bash tools/suspend-test.sh rtc 30            # decisive: real s2idle + alarm
+    bash tools/suspend-test.sh report                 # after any hard reset
+
+Interpretation:
+
+* `rtc 30` returns — s2idle entry/exit and RTC wakeup both work, so the original
+  failure was the missing wake source; then verify the power key and the lid
+  really do wake it;
+* `rtc 30` never returns — the hang is in the s2idle entry or in the wakeup
+  routing; next suspects are the deepest cluster state and the wakeup path behind
+  the PDC;
+* `level devices`/`platform` hangs — a driver, named by the last line of the
+  verbose dpm log (`pm_debug_messages=1`).
 
 ## Build note
 
