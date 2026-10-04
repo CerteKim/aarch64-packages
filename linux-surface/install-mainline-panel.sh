@@ -65,13 +65,15 @@ rm -f /boot/initramfs-linux-mibook.img
 mv "$NEW_INITRAMFS" /boot/initramfs-linux-mibook.img
 chmod 644 /boot/initramfs-linux-mibook.img
 
-echo "==> installing the DTB (both GRUB-referenced paths)"
+echo "==> installing the DTB"
 # The single-link variant is the one that renders correctly; use
 # ./set-panel-link-mode.sh dual to switch the DTB afterwards.
+#
+# Only the stock path is written: sc8180x-xiaomi-book-12.4-oc.dtb is the
+# overclocked GPU variant built by the kernel Makefile, not a copy of this
+# one.  Install it with tools/refresh-boot-from-tree.sh.
 install -Dm644 "$REPO/panel-dtb/sc8180x-xiaomi-book-12.4.single-link.dtb" \
     "$BOOT_DTB_DIR/${DTB}"
-install -Dm644 "$REPO/panel-dtb/sc8180x-xiaomi-book-12.4.single-link.dtb" \
-    "$BOOT_DTB_DIR/sc8180x-xiaomi-book-12.4-oc.dtb"
 
 echo
 echo "Done."

@@ -1816,6 +1816,71 @@ removed.  Those pins are configured active-low with an internal pull-up,
 matching the Surface Pro X port; if a key reports the opposite of what is
 pressed, flip `GPIO_ACTIVE_LOW` (or the bias).
 
+## Overclocked GPU device tree (`-oc`) — added, pending hardware check
+
+The part on this board is binned above the profile `sc8180x.dtsi` describes: the
+DSDT carries several GPU DVFS sets, and the stock table Linux uses is the
+slowest of them.  They are all `"ENGINE_PSTATE_SET" 0x02` /
+`"GRAPHICS_FREQ_CONTROL"` / `"CORE_CLOCK"` entries in `~/acpi-dumps/dsdt.dsl`,
+each PSTATE giving the core clock, a GPU percentage and the RPMh corner:
+
+| set | PSTATE -> CORE_CLOCK (RPMh level) |
+| --- | --- |
+| stock (what `sc8180x.dtsi` has) | 514 (TURBO_L1), 500 (TURBO), 461 (NOM_L1), 405 (NOM), 315 (SVS_L1), 256 (SVS), 177 (LOW_SVS) |
+| 670 MHz profile | 670 (TURBO_L1), 625 (TURBO), 595 (NOM_L1), 530 (NOM), 392 (SVS_L1), 315 (SVS), 235 (LOW_SVS) |
+| 718 MHz profile | 718 (TURBO_L2), 670 (TURBO_L1), 625 (TURBO), 595 (NOM_L1), 530 (NOM), 392 (SVS_L1), 315 (SVS), 235 (LOW_SVS) |
+
+Windows on this machine reports 670 MHz as the GPU maximum, i.e. it runs the
+670 MHz profile.
+
+### Why declaring the states is enough
+
+The a6xx driver does not read its DVFS levels from the firmware — it *sends* its
+whole OPP table to the GMU over HFI:
+
+    a6xx_hfi_send_perf_table(): msg.num_gpu_levels = gmu->nr_gpu_freqs;
+                                msg.gx_votes[i].freq = gmu->gpu_freqs[i] / 1000;
+
+and each level's GX rail vote comes from the OPP's `opp-level`
+(`a6xx_gmu_rpmh_arc_votes_init()` -> `a6xx_gmu_get_arc_level()` ->
+`dev_pm_opp_get_level()`), matched against the RPMh `gfx.lvl` command-db list.
+So an extra OPP carrying the vendor's own corner fully describes a new firmware
+DVFS level; nothing else needs to change.
+
+### What is in the tree
+
+`sc8180x-xiaomi-book-12.4.dts` was split into `sc8180x-xiaomi-book-12.4.dtsi`
+(the board) plus two wrappers, so the variant can share it:
+
+* `sc8180x-xiaomi-book-12.4.dts` — stock.  Verified byte-identical to the DTB
+  built before the split;
+* `sc8180x-xiaomi-book-12.4-oc.dts` — adds the three states missing from the
+  stock table:
+
+| state | `opp-level` |
+| --- | --- |
+| 530 MHz | `RPMH_REGULATOR_LEVEL_NOM` (`0x100`) |
+| 595 MHz | `RPMH_REGULATOR_LEVEL_NOM_L1` (`0x140`) |
+| 670 MHz | `RPMH_REGULATOR_LEVEL_TURBO_L1` (`0x1a0`) |
+
+625 MHz (`TURBO`) and 718 MHz (`TURBO_L2`) are deliberately left out.
+
+Both are build targets now (the qcom `Makefile` gained the `-oc` entry and the
+PKGBUILD ships both), so the `-oc` filename finally means something: the GRUB
+default entry already pointed at it, which makes the default boot the
+overclocked one and the Advanced entry the stock one.  Because the two names no
+longer hold the same file, `set-panel-link-mode.sh` and
+`install-mainline-panel.sh` now only write the stock path.
+
+### Verify
+
+    grep . /sys/class/devfreq/2c00000.gpu/available_frequencies
+
+should list `530000000 595000000 670000000` in addition to the stock set, and a
+GPU load (`glmark2`, `vkmark`) should clock up to 670 MHz.  Watch
+`dmesg | grep -iE "gpu|adreno"` for faults; the way back is to delete the three
+OPPs and rebuild.
+
 ## Build note
 
 `tools/lib/bpf/libbpf.c` needs explicit `(char *)` casts on `strstr()`/`strchr()`
