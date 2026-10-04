@@ -1657,13 +1657,22 @@ Sources: `MiCode/Xiaomi_Kernel_OpenSource` branch `nabu-r-oss`;
 (`arch/arm64/boot/dts/qcom/sm8150-vidc.dtsi`,
 `drivers/media/platform/msm/vidc/venus_boot.c`, `venus_hfi.c`).
 
-## Suspend / s2idle — open
+## Suspend / s2idle — WORKING (root cause: the power key was never enabled)
 
-Status: **not working.**  A suspend attempt turns the screen off and the machine
-never comes back; a hard reset is required.  `suspend_stats` reads 0/0 and no
-`PM: suspend entry` line exists anywhere in the retained journal, so the hang has
-never been captured — everything below is from the source, the DT and the vendor
-reference, not from a trace.
+Status: **working**, verified on hardware 2026-10-04.  Two s2idle cycles,
+`suspend_stats: success=2 fail=0`, with
+
+    PM: suspend entry (s2idle)
+    PM: suspend exit
+
+in the kernel log, entered and left with the power button; the lid switch does
+the same.
+
+The original symptom — "screen goes off and never comes back, hard reset
+required" — was never a hang in the suspend path: the machine was suspending
+correctly and **nothing could wake it**.  That is also why `suspend_stats` read
+0/0 and why no `PM: suspend entry` line existed in any retained boot — the only
+way out was a hard reset, which discarded the evidence.
 
 ### What is already in place
 
@@ -1693,23 +1702,29 @@ The second `pdc` region that `sm8250`/`sc8280xp` carry (`<0 0x17c000f0 0x60>`) i
 absent from the vendor DT too, and the mainline driver only maps resource 0 — so
 it is not a deviation.
 
-### Bug found: the power key was never enabled
+### The fix
 
-`sc8180x-pmics.dtsi` leaves the PM8150 PON power key `status = "disabled"`, and
-the Xiaomi board DTS never enables it.  Upstream fixed the same omission for the
-other SC8180X devices in `3706bcfbdb8a` ("arm64: dts: qcom: sc8180x: Enable the
-power key") by enabling `&pmc8180_pwrkey` per board.
+`sc8180x-pmics.dtsi` declares the PM8150 PON power key but leaves it
+`status = "disabled"`, and no board enabled it for the Xiaomi — upstream does
+that per board (`3706bcfbdb8a`, "arm64: dts: qcom: sc8180x: Enable the power
+key", for Primus and the Flex 5G).  The board DTS now carries:
 
-Consequences here: there is no `KEY_POWER` input device
-(`/proc/bus/input/devices` has no pwrkey), the power key is absent from
-`/sys/class/wakeup/*`, and since `pwrkey_data.wakeup_source_default = true` the
-wakeup registration comes for free once the node is enabled.  In other words
-**the power button cannot wake the machine**, which by itself reproduces
-"screen off, never comes back".
+    &pmc8180_pwrkey {
+            status = "okay";
+    };
 
-`panel-dtb/sc8180x-xiaomi-book-12.4-oc-pwrkey.dtb` applies the one-line fix at
-runtime (the `pwrkey-enable.dts` overlay merged with `fdtoverlay` onto the
-pristine `-oc` DTB); it is verified to contain `pwrkey { status = "okay" }`.
+Consequences of the omission: there was no `KEY_POWER` input device
+(`/proc/bus/input/devices` had no pwrkey) and the power key was absent from
+`/sys/class/wakeup/*`.  With the node enabled, `pm8941-pwrkey` probes and — since
+`pwrkey_data.wakeup_source_default = true` — registers itself as a wakeup source
+(`c440000.spmi:pmic@0:pon@800:pwrkey`), which is what lets the power button wake
+the machine from s2idle.
+
+`panel-dtb/pwrkey-enable.dts` + `sc8180x-xiaomi-book-12.4-oc-pwrkey.dtb` was the
+runtime form used for the first test.  Note that `fdtoverlay` **cannot** apply it
+to these DTBs — they are built without `-@`, so there is no `/__symbols__` node
+("base blob does not have a '/__symbols__' node") — hence the fix has to come
+from a source build.
 
 ### Why the usual pm_test ladder cannot localise this
 
@@ -1720,7 +1735,7 @@ ladder proves the device and noirq/late paths are clean but cannot reach the
 s2idle entry itself (cpuidle -> PSCI OSI -> `cluster_sleep_aoss_sleep`, wakeup
 through the PDC).  Only a real suspend exercises that.
 
-### Recipe
+### Recipe (kept for reference — the ladder turned out not to be needed)
 
 `tools/suspend-test.sh` (root) writes a synced marker log, so after a hard reset
 `ATTEMPT` without `RESUMED` means the kernel never returned:
@@ -1744,6 +1759,39 @@ Interpretation:
   the PDC;
 * `level devices`/`platform` hangs — a driver, named by the last line of the
   verbose dpm log (`pm_debug_messages=1`).
+
+## Volume keys — the ACPI0011 gap (probe in progress)
+
+The volume keys are described **only** in ACPI, by the Generic Buttons device
+(`\_SB.BTNS`, `_HID ACPI0011`) that Linux has no driver for — the vendor device
+tree does not mention them, and neither do the upstream SC8180X boards.  The
+description is:
+
+| `_CRS` GpioInt on `\_SB.PM01` | flags | `_DSD` usage | key |
+| --- | --- | --- | --- |
+| pin `0x0001` | ActiveBoth, Exclusive, PullDown | page `0x0C`, `0xEA` | Volume Down |
+| pin `0x0085` | ActiveBoth, Exclusive, PullUp | page `0x0C`, `0xE9` | Volume Up |
+| pin `0x0000` | ActiveBoth, ExclusiveAndWake, PullDown | page `0x01`, `0x81` | (not a key) |
+
+`\_SB.PM01` (`_HID QCOM0430`, `_UID 1`) is the aggregate PMIC GPIO controller:
+one pin space covers the GPIOs of every PMIC, and its stride is not documented.
+Pin `0x0001` is certain — GPIO 1 of the first PMIC, which is exactly where the
+linux-surface Surface Pro X port (`4bc1a33`, "surface-pro-x: Add support for
+volume buttons") puts volume-down.  Pin `0x0085` has three readings, so the board
+DTS instantiates all three as separate input devices: whichever one fires
+identifies the wiring, and the other two then get removed.
+
+| probe | reading | Linux |
+| --- | --- | --- |
+| A | `(USID 8 << 4) \| 5` | `pmc8180_2_gpios` 5 |
+| B | `(USID 4 << 5) \| 5` | `pmc8180c_gpios` 5 |
+| C | `0x80 \| 5` | `pmc8180_1_gpios` 5 |
+
+Test with `sudo evtest` (or `sudo libinput debug-events`): the device name in the
+event line names the probe that fired ("Volume Up probe A/B/C").  The pins are
+configured active-low with an internal pull-up, matching the Surface Pro X
+port; if a key reports the opposite of what is pressed, flip `GPIO_ACTIVE_LOW`
+(or the bias).
 
 ## Build note
 
