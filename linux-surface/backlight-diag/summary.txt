@@ -1,0 +1,235 @@
+== 2026-10-04T04:26:19+00:00   kernel 6.18.2-1-mibook+
+== regmap entries:
+0-00
+0-01
+0-02
+0-04
+0-05
+0-06
+0-08
+100000.clock-controller
+17c00000.mailbox
+1f40000.hwlock
+217:250:0:0
+217:250:1:0
+2c90000.clock-controller
+9200000.system-cache-controller-llcc0_base
+9200000.system-cache-controller-llcc1_base
+9200000.system-cache-controller-llcc2_base
+9200000.system-cache-controller-llcc3_base
+9200000.system-cache-controller-llcc4_base
+9200000.system-cache-controller-llcc5_base
+9200000.system-cache-controller-llcc6_base
+9200000.system-cache-controller-llcc7_base
+9200000.system-cache-controller-llcc_broadcast_base
+ad00000.clock-controller
+af00000.clock-controller
+c263000.thermal-sensor-srot
+c263000.thermal-sensor-tm
+c265000.thermal-sensor-srot
+c265000.thermal-sensor-tm
+sdw:0:0:0217:2110:00:3
+sdw:0:0:0217:2110:00:4
+== pmic regmap: /tmp/backlight-debugfs/regmap/0-05
+== regmap name: pmic-spmi
+== regmap range: 0-ffff 
+
+== before: brightness=335 max=4095 type=raw bl_power=0
+== mode: 1600x2560
+
+== request=0  readback=0 actual=0 bl_power=0 dpms=On
+   dumped 65536 register lines
+
+== request=3000  readback=3000 actual=3000 bl_power=0 dpms=On
+   dumped 65536 register lines
+
+== register lines that differ between brightness 0 and 3000:
++a031: 80
+-a031: 00
+
+== WLED modulator registers at request=3000:
+   d800: 00
+   d846: 00
+   d946: 00
+   d950: 00
+   d951: 00
+   d952: 00
+   d953: 00
+   d954: 00
+   d960: 00
+   d961: 00
+   d962: 00
+   d963: 00
+   d964: 00
+   d965: 00
+   (d846 = module enable, d950 = modulator A enable,
+    d953/d954 = modulator A brightness LSB/MSB, d965 = mod sync)
+
+== LPG channel windows at request=3000 (0x40 clock/type/value/enable, 0x50 ramp):
+   -- b100
+      b140: 10
+      b141: 00
+      b142: 00
+      b143: 00
+      b144: 00
+      b145: 00
+      b146: 00
+      b147: 00
+      b148: 00
+      b149: 00
+      b14a: 00
+      b14b: 00
+      b14c: 00
+      b14d: 00
+      b14e: 00
+      b14f: 00
+      b150: 00
+      b151: 00
+      b152: 00
+      b153: 00
+      b154: 00
+      b155: 00
+      b156: 00
+      b157: 00
+      b158: 00
+      b159: 00
+      b15a: 00
+      b15b: 00
+      b15c: 00
+      b15d: 00
+      b15e: 00
+      b15f: 00
+   -- b200
+      b240: 13
+      b241: 13
+      b242: 61
+      b243: 00
+      b244: 2b
+      b245: 00
+      b246: 86
+      b247: 00
+      b248: 00
+      b249: 00
+      b24a: 00
+      b24b: 00
+      b24c: 00
+      b24d: 00
+      b24e: 00
+      b24f: 00
+      b250: ff
+      b251: 00
+      b252: 02
+      b253: 00
+      b254: 01
+      b255: 00
+      b256: 01
+      b257: 00
+      b258: 00
+      b259: 00
+      b25a: 00
+      b25b: 00
+      b25c: 00
+      b25d: 00
+      b25e: 00
+      b25f: 00
+   -- b300
+      b340: 10
+      b341: 13
+      b342: 61
+      b343: 00
+      b344: 2b
+      b345: 00
+      b346: 04
+      b347: 00
+      b348: 00
+      b349: 00
+      b34a: 00
+      b34b: 00
+      b34c: 00
+      b34d: 00
+      b34e: 00
+      b34f: 00
+      b350: 00
+      b351: 00
+      b352: 00
+      b353: 00
+      b354: 00
+      b355: 00
+      b356: 00
+      b357: 00
+      b358: 00
+      b359: 00
+      b35a: 00
+      b35b: 00
+      b35c: 00
+      b35d: 00
+      b35e: 00
+      b35f: 00
+   -- bc00
+      bc40: 00
+      bc41: 04
+      bc42: 00
+      bc43: 00
+      bc44: 00
+      bc45: 00
+      bc46: 00
+      bc47: 00
+      bc48: 00
+      bc49: 00
+      bc4a: 00
+      bc4b: 00
+      bc4c: 00
+      bc4d: 00
+      bc4e: 00
+      bc4f: 00
+      bc50: 00
+      bc51: 00
+      bc52: 00
+      bc53: 00
+      bc54: 00
+      bc55: 00
+      bc56: 00
+      bc57: 00
+      bc58: 00
+      bc59: 00
+      bc5a: 00
+      bc5b: 00
+      bc5c: 00
+      bc5d: 00
+      bc5e: 00
+      bc5f: 00
+   -- bd00
+      bd40: 00
+      bd41: 07
+      bd42: 05
+      bd43: 00
+      bd44: 00
+      bd45: 01
+      bd46: 80
+      bd47: 00
+      bd48: 00
+      bd49: 00
+      bd4a: 00
+      bd4b: 00
+      bd4c: 00
+      bd4d: 00
+      bd4e: 00
+      bd4f: 00
+      bd50: 00
+      bd51: 00
+      bd52: 00
+      bd53: 00
+      bd54: 00
+      bd55: 00
+      bd56: 00
+      bd57: 00
+      bd58: 00
+      bd59: 00
+      bd5a: 00
+      bd5b: 00
+      bd5c: 00
+      bd5d: 00
+      bd5e: 00
+      bd5f: 00
+
+== done - results in /home/certe/aarch64-packages/linux-surface/backlight-diag

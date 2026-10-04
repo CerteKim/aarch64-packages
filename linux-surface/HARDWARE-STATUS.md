@@ -907,11 +907,12 @@ no second graph port, so one kernel boots either wiring:
 `./set-panel-link-mode.sh single|dual` installs either one into both
 GRUB-referenced DTB paths.
 
-## Video decode: the hardware is IRIS1, and mainline has no driver for it yet
+## Video decode: the hardware is IRIS1, and the SC8180X entry is device-tree only
 
 The SC8180X video accelerator is a **Venus/IRIS VPU**.  What exists today:
 
-* the kernel has `CONFIG_VIDEO_QCOM_VENUS=m` and the `venus` module builds;
+* the `venus` driver has no SM8150/SC8180X platform data at all (`core.c` stops
+  at `sc7280`/`sm8250`); `xiaomi-only.config` disables it and builds `iris`;
 * VIDEOCC is already upstream for this SoC (`videocc-sc8180x` on
   `qcom,sm8150-videocc`, with `VENUS_GDSC`, `VCODEC0_GDSC`, `VCODEC1_GDSC`
   and the IRIS core clocks), and `gcc-sc8180x` has the Venus reset with the
@@ -1043,7 +1044,8 @@ The probe answered everything it could and then had to be stopped:
   machine dies: with no firmware the VPU does not answer the boot-handshake
   registers, all four boot attempts stalled ~27 s in with
   `rcu_preempt detected stalls`, and the traces only show victims blocked on
-  mm locks (no iris frame survives).
+  mm locks (no iris frame survives).  (The "no firmware" part of this diagnosis
+  was wrong — the driver never requested any firmware at all, see below.)
 
 So the video-codec node is now `disabled` in `sc8180x.dtsi` — the node and its
 full resource set stay in the tree as a reference, but nothing probes the
@@ -1068,6 +1070,504 @@ What a future attempt needs, in order:
 To re-enable the experiment later: add `&venus { status = "okay"; };` to the
 board device tree, build, and be ready to boot the previous kernel if the
 firmware is still missing.
+
+### Second round: SC8280XP/SM8350 is the reference, and the blocker was `memory-region`
+
+Re-checked 2026-10-04 against the upstream series and the driver source.
+
+**sc7180 is the wrong reference, SC8280XP is the right one.**  sc7180 sits in
+the *venus* driver with `HFI_VERSION_4XX` and `venus-5.4/venus.mbn`, five
+clocks and `iommus = <&apps_smmu 0x0c00 0x60>` — the previous AR50 generation,
+not usable for an IRIS1 core.  The live series
+`[PATCH v7 0/6] media: iris: enable SM8350 and SC8280XP support` instead adds
+SM8350/SC8280XP to the iris driver's **Gen1** path, and does it with device
+tree only: the node is
+`compatible = "qcom,sc8280xp-iris", "qcom,sm8250-venus"`, a SoC-specific
+string with the SM8250 one as fallback, so "driver bits ... covered by
+compatible string now" — the sm8250 platform data applies unchanged.  Its
+cover letter also records two things that match this board: the **venus**
+driver fails to boot the Iris core on SM8350 (a `UC_REGION` error), and the
+SM8250 firmware is *not* compatible with SM8350/SC8280XP, so every Gen1 SoC
+needs the firmware extracted from its own Windows/Android install.
+
+**Why the earlier probe could not have reached the firmware.**
+`iris_firmware.c` gets the carve-out through the node's `memory-region`
+phandle and returns `-EINVAL` when it is missing; neither the node nor this
+device tree had such a region, so `request_firmware()` was never called and
+the firmware question was never actually tested.  Two more details from the
+source: `dev_pm_opp_set_rate()` in `iris_vpu_common.c` is called *without*
+checking its return value, so the OPP complaint in the log was not by itself
+the fatal step, and the first thing that touches VPU registers after power-on
+is `set_preset_registers()` — which is where a machine that "hangs after
+power on" would be hanging.
+
+**What changed in this round:**
+
+* `sc8180x.dtsi` gained a `video_mem` carve-out (`0xa0000000`, 5 MB, `no-map`,
+  immediately above the last bootloader reservation) and the node now has
+  `memory-region` and `firmware-name`;
+* the compatible is upstream-shaped (`"qcom,sc8180x-iris",
+  "qcom,sm8250-venus"`) and the driver-side `sc8180x_data` entry is gone: it
+  was a byte-identical copy of `sm8250_data`, so the fallback is exactly
+  equivalent and the iris driver diff is now zero;
+* the firmware was extracted from the Windows partition
+  (`Windows/System32/qcvss8180.mbn`, `VIDEO.IR.1.2-00079-PROD-2`, ELF32 ARM
+  with the usual Qualcomm hash-table program headers) and staged in
+  `firmware/qcom/sc8180x/` with its provenance;
+* the node is still `disabled`, so nothing probes until a deliberate run.
+
+**Still open, in order:**
+
+1. install the firmware
+   (`sudo install -Dm644 firmware/qcom/sc8180x/venus.mbn
+   /lib/firmware/qcom/sc8180x/venus.mbn`) and enable `&venus`;
+2. check the apps_smmu stream: `0x2100` is copied from sm8250 while sc8280xp
+   uses `0x2a00`, so it is per-SoC silicon.  ACPI does not answer it — the
+   IORT has no Venus named component and the DSDT only carries the PILC/MON0
+   engine manifest (`Venus`, `ArmSmmuV2`, one non-secure plus four secure page
+   tables, matching the iris driver's `tz_cp_config`) with a SMMU *UUID*, no
+   number — so expect to read the real one from an arm-smmu fault;
+3. if power-on wedges before any firmware message: this SoC's video clock
+   controller has a `VIDEO_CC_IRIS_AHB_CLK` that SM8250 and SM8350 do not
+   have, and none of the three clocks the driver enables covers it — a bus
+   stall on register access would look exactly like that;
+4. userspace: still no VA-API driver, so only the V4L2 stateful path (ffmpeg
+   `v4l2m2m`), not the browser stack.
+
+One naming caveat to keep in mind: upstream's binding patch describes the
+SM8250 block as "Iris v2.xx" while this board's firmware version is
+`VIDEO.IR.1.2`.  If `IR.1.2` really is an *older* Iris revision than the
+SM8250 core, the Gen1 HFI/`iris_vpu2_ops` path may not match the firmware and
+the failure will look like a firmware boot/handshake error rather than a
+device-tree one.  The SC8280XP/SM8350 series is still the closest available
+reference (same driver path, same SoC vintage), and it is the only in-tree
+one; the first probe after install will answer this.
+
+**Probe run: `tools/probe-vdec-run.sh`, and the packaging failure it replaces.**
+
+The first attempt at this (package `-6`, 2026-10-04 ~08:36) did not boot
+properly: the kernel log flooded with `BPF: Invalid name` and
+`failed to validate module [fuse] BTF: -22`, and `pd-mapper.service` (the
+Qualcomm PD mapper) failed, so the machine was put back on the previous
+package.  The cause was the packaging, not the VPU work:
+`tools/make-kernel-package.sh` did not put the kernel image into the package or
+into `/boot`, so `pacman -U` replaced all 2557 modules while `/boot` kept the
+kernel from an older build - and the mkinitcpio hook was interrupted, so the
+initramfs stayed old as well.  The booted kernel then validated every module's
+BTF against its own vmlinux and rejected modules from a different build (hence
+the "BPF" flood), and the remoteproc/qrtr stack behind `pd-mapper` stopped
+working.  Nothing in the device tree or the iris driver was implicated: the
+interrupted install also left the old (node-disabled) DTB in place, so the VPU
+itself never probed.
+
+What changed since:
+
+* the package now ships `/boot/vmlinuz-linux-mibook` (the tree's `Image`,
+  gzipped) plus a `.INSTALL` that runs `depmod` and `mkinitcpio -P`, so a
+  package install can no longer leave a kernel/module mix;
+* it ships both GRUB DTB paths as the **parked** DTB (VPU node disabled) and,
+  separately, a `sc8180x-xiaomi-book-12.4-vdec-probe.dtb` produced by setting
+  that node's `status` to `okay`.  The board DTS in the tree stays parked, so
+  the default boot can never probe the VPU;
+* `tools/probe-vdec-run.sh` now does, in order: save the known-good `/boot`
+  files into the fallback directory, install the staged firmware, write
+  `blacklist qcom-iris` (a plain blacklist still allows an explicit
+  `modprobe qcom-iris`), install the package, copy the probe DTB over both GRUB
+  paths (keeping a `-parked.dtb` copy), and then *verify* before telling you to
+  reboot: `/boot/vmlinuz` must be this tree's build, the initramfs must be
+  newer, both DTBs must have the node enabled with its `memory-region`, and the
+  blacklist must be in place.  Any mismatch aborts the script;
+* `tools/recover-working.sh` now restores the parked DTB and leaves the kernel
+  alone by default, because restoring the fallback kernel while the new modules
+  are installed is exactly the mix that broke the `-6` boot.  `--restore-kernel`
+  exists for a kernel that cannot boot at all, with that caveat printed.
+
+The first `-8` install then exposed two more packaging defects, both fixed in
+`-9` and both worth remembering:
+
+* the package did not ship `/etc/mkinitcpio.d/linux-mibook.preset`.  The
+  previous package owned that file, so pacman deleted it as part of the
+  upgrade, `mkinitcpio -P` then failed with
+  `No presets found in /etc/mkinitcpio.d`, and `/boot` was left with an
+  initramfs built from the *old* kernel's modules (the pacman mkinitcpio hook
+  stays quiet in this situation).  The preset is now shipped, and the
+  `.INSTALL` scriptlet falls back to an explicit
+  `mkinitcpio -k /boot/vmlinuz-linux-mibook -g /boot/initramfs-linux-mibook.img`
+  if it ever finds no presets again;
+* every file was packaged with the build user's uid/gid, so the installed
+  kernel modules were owned by `certe` instead of root - a local privilege
+  problem, since that user could edit modules root later loads.  `bsdtar` now
+  records `root:root`, which also removes the per-file warnings for the vfat
+  `/boot` partition.  `tools/probe-vdec-run.sh` fails its pre-reboot
+  verification if the installed module is not root-owned.
+
+The iris driver bug fixes from the first round are kept (the `sc8180x-videocc`
+match in `videocc-sm8150.c`, `CONFIG_SM_VIDEOCC_8150`, the missing 533/365 MHz
+OPPs), because they are independent of how the VPU node is expressed.
+
+### Third round: the VPU answers — correct register map, and the wall at TZ
+
+This round got further than every previous attempt combined, and ended at a
+boundary that is *not* a Linux bug.  The short version:
+
+    VPU powered -> registers respond -> IRQ init done -> firmware in place
+    -> TZ authenticates the image -> TZ refuses to configure/release the core
+
+**The register map was the wall.**  `iris_vpu_register_defines.h` hardcodes the
+*Venus 6xx* layout (`CPU 0xA0000`, `CPU_CS 0xA0000`, `WRAPPER 0xB0000`), which is
+what SM8250-and-later use.  SM8150/SC8180X uses the **older Venus 4xx layout**:
+
+| block | iris driver had | SC8180X uses |
+| --- | --- | --- |
+| CPU | `0x000A0000` | `0x000C0000` |
+| CPU_CS | `0x000A0000` | `(CPU + 0x12000)` = `0x000D2000` |
+| WRAPPER | `0x000B0000` | `0x000E0000` |
+| VBIF | - | `0x00080000` |
+
+Three independent sources agree: the mainline **venus** driver
+(`hfi_venus_io.h` has both layouts, `*_V6` vs plain), the vendor's downstream
+IRIS1 header (`msm-extra/video-driver`, `hfi_io_common.h`, the same values), and
+the hardware itself - after the change `WRAPPER_INTR_MASK` (`0x0E0010`) reads
+**`0x1f6`**, its documented reset value, and everything after it proceeds.  Every
+access before that went to an unmapped address, which is why an unpowered block
+*stalled* the bus (no response) and a powered one raised a synchronous external
+abort (`0x0B0010`, `Comm: v4l_id`) - the two symptoms that consumed several
+rounds.
+
+The same conclusion came out of the vendor device tree, which supplied the rest
+of the node: **six** clocks (`gcc_video_axic`, `gcc_video_axi0`,
+`gcc_video_axi1`, `video_cc_mvsc_core`, `video_cc_mvs0_core`,
+`video_cc_mvs1_core`) instead of three, four resets (`GCC_VIDEO_AXIC_CLK_BCR`,
+`VIDEO_CC_MVSC_CORE_CLK_BCR`, `GCC_VIDEO_AXI0_CLK_BCR`,
+`GCC_VIDEO_AXI1_CLK_BCR`) instead of two, and the IOMMU SID **`0x1300 0x60`**
+instead of SM8250's `0x2100 0x400`.  `axic` is the AXI *config* port a CPU
+register access goes through and was simply never enabled.  The vendor window is
+2 MB, but that overlaps the VIDEOCC at `0x0AB00000` and mainline *reserves* its
+region, so the node keeps 1 MB.
+
+**What is in the tree from this round**
+
+* `sc8180x.dtsi`'s venus node: six clocks, four resets (AXIC carried as the
+  driver's `"bus"` reset, so no driver change was needed for it), six
+  clock-names, SID `0x1300 0x60`, `memory-region`, 1 MB window;
+* iris: a new `IRIS_AXIC_CLK` type, `"axic"`/`"axi1"` entries in the SM8250
+  clock table, and best-effort enable/disable of both (a missing clock returns
+  `-EINVAL` and is tolerated, so SM8250 is unaffected);
+* `reserved_memory` is now labelled so the board DTS can add children, and the
+  board DTS carries a **ramoops** region (`0xa0500000`, 1 MB) - see the capture
+  recipe below;
+* `tools/update-probe-dtb.sh` (rebuild DTBs, install parked + probe variants
+  into both GRUB paths, verify), `tools/repack-venus-firmware.py`,
+  `windows-drivers/` (the Windows PIL and video drivers plus their INFs) and
+  `~/acpi-dumps/` (DSDT/CSRT).
+
+**The firmware path, step by step**
+
+`iris_firmware.c` needs the node's `memory-region`; the SM8250 platform data
+uses PAS id 9 and `qcom/sc8180x/venus.mbn` (from the Windows driver store,
+`qcvss8180.mbn`, ELF32, `VIDEO.IR.1.2-00079-PROD-2`).  With the register map
+fixed, the sequence now runs: power-on -> `WRAPPER_INTR_MASK = 0x1f6` -> IRQ
+init -> `qcom_mdt_load` -> `PAS auth and reset`.  Two findings decide the rest:
+
+* the Windows image marks all three LOAD segments `QCOM_MDT_RELOCATABLE`
+  (p_flags bit 27), so the loader calls `qcom_scm_pas_mem_setup(9, addr, size)`
+  - and **TZ answers `-EINVAL` for every region we can name**: our own
+  `0xa0000000`, the bootloader's 5 MB carve-out `0x9ffb0000` (whose size matches
+  the firmware footprint exactly), and the 40 MB / ~43 MB reserved pools;
+* `qcom_scm_pas_init_image` *succeeds* - TZ authenticates the untouched image -
+  so this is not a signature problem.
+
+Two experiments narrowed it further:
+
+* **Repacking the image does not help.**  Clearing bit 27 and rebasing `p_paddr`
+  onto the carve-out (only 9 bytes change, all inside the program-header table,
+  no hashed segment byte touched) makes the loader skip the SCM call
+  (`qcom_mdt_load ret=0`, firmware in place) but `qcom_mdt_load` then fails one
+  step earlier with `error -22 initializing firmware`: **TZ authenticates the ELF
+  header and program-header table too**, so the image cannot be re-shaped
+  (`tools/repack-venus-firmware.py` is kept for reference);
+* skipping *only* the SCM call, via a debug parameter on `mdt_loader`, gets the
+  firmware into memory (`ret=0`) but `PAS auth ret=-22` - consistent with TZ
+  wanting a configured region before it will release the core.
+
+**The control that matters:** `qcom/XIAOMI/BOOK124/qcadsp8180.mbn` is
+*relocatable too* (16 segments, 26 MB) and it goes through the identical
+`qcom_mdt_load` -> `qcom_scm_pas_mem_setup` path **and works** on this machine
+(the SLPI likewise, 18 segments, in `0x92c00000`).  So the TZ call is
+implemented and functional here; the refusal is specific to the video PAS -
+either its id or the region TZ has configured for it.  `PAS_IS_SUPPORTED`
+(`0x07`) exists in the kernel's command set but returns 0 for every id on this
+TZ, i.e. this is an older TZ revision than the kernel assumes.
+
+Sweeping ids to find the video PAS is **not safe**: with `pas_id=12` the machine
+wedged even with the core release disabled (`no_auth=1`), because feeding the
+video image to another subsystem's PAS disturbs a live engine.  Do not repeat it.
+
+**What Windows does (from `qcpil8180.sys`, copied into `windows-drivers/`)**
+
+It is a KMDF **WMI** driver (imports `IoWMIRegistrationControl`; contains no
+`smc`/`hvc` instruction), and it knows the subsystem as `VENUS` among
+`ADSP CDSP SLCPI SPSS SLPI MODEM WCNSS ISS9 THSS9 SSCS8 HSS9 GFXSUC GCTL RSDS`.
+Its messages show a flow with steps mainline has no equivalent for:
+
+    Tree ELF image authentication                       = Linux pas_init_image (works)
+    Request to define relocatable subsystem memory      = Linux pas_mem_setup  (fails)
+    Request to share subsystem memory                   - nothing in Linux
+    Request to unlock subsystem memory / XPU            - nothing in Linux (TREE)
+
+The kernel's whole PIL command set is `INIT_IMAGE 0x01`, `MEM_SETUP 0x02`,
+`AUTH_AND_RESET 0x05`, `SHUTDOWN 0x06`, `IS_SUPPORTED 0x07`, `MSS_RESET 0x0a`;
+the DSDT exposes `\_SB.SCM0` (`QCOM040B`), `\_SB.TREE` (`QCOM0476`, whose `_CRS`
+points at a dynamic `\_SB.TCMA`/`TCML` region) and `\_SB.PILC` (`QCOM041B`), and
+the video device's `_CRS` lists only MMIO/IRQs/GPIOs - no firmware RAM range.
+The carve-outs are the EFI reservations visible in `/proc/iomem`
+(`9d400000-9ff91fff`, `9ffb0000-a04fffff`).
+
+**Where it stands, and how to go further**
+
+The Linux side is correct up to the TZ boundary: power, clocks, resets, SID,
+register map, IRQ, firmware placement and image authentication all work, and
+failures are clean and repeatable (no bus access in the teardown path).  To get
+past it we need one of:
+
+* the **video PAS id** and the **region TZ has configured** for it, from the
+  Windows/UEFI/secure side (the vendor's PIL configuration or a memory-map dump)
+  - not by probing TZ, which is unsafe;
+* or the **extra TZ steps** (`share`, XPU `unlock`), if those turn out to be
+  prerequisites rather than follow-ups.
+
+**Debug hooks and tools from this round** (all temporary; revert before any
+upstream submission)
+
+| hook | where | purpose |
+| --- | --- | --- |
+| `fw_phys`, `fw_size` | `qcom_iris` params | move the carve-out without touching the DTB |
+| `pas_id`, `fw_name` | `qcom_iris` params | try another PAS id / firmware |
+| `no_auth` | `qcom_iris` param | stop after image init; never releases the core |
+| `scan_pas` | `qcom_iris` param | ask TZ `PAS_IS_SUPPORTED` for ids 0..31 |
+| `skip_pas_mem_setup` | `mdt_loader` param | skip the TZ relocation call only |
+| `IRIS-TRACE:` breadcrumbs | iris `core/resources/vpu_common/firmware` | progress log |
+| VPU-free teardown | `iris_vpu_power_off_controller` | makes a failed probe survivable (it used to abort a second time and take the machine down) |
+| `tools/videocc-peek.py` | `dump`, `powerup`, `gdsc-test`, `scan`, ... | /dev/mem view of VIDEOCC/GCC; `scan` and VPU reads are **not** safe |
+
+Gotchas worth keeping:
+
+* `mdt_loader` is loaded **from the initramfs**, so replacing
+  `/usr/lib/modules/.../mdt_loader.ko` does nothing until `mkinitcpio -P` packs
+  the new copy in;
+* `find ... -iname A -o -iname B -exec cp {} dir \;` only applies `-exec` to
+  `B`; the `.sys` files were silently skipped the first time;
+* a kernel-mode access to an unmapped VPU register is an oops and is survivable,
+  a *user-mode* `/dev/mem` read of the same address can take the machine down -
+  do not "scan" the window;
+* journald cannot flush during a bus stall, and a hard power-cycle wipes RAM;
+  for a post-mortem either panic deliberately (`panic_on_rcu_stall=1`,
+  `kernel.panic=20`, plus a shortened `rcu_cpu_stall_timeout`) so ramoops
+  captures the log and the machine reboots itself - read it back with
+  `sudo cat /sys/fs/pstore/dmesg-ramoops-0` - or photograph the screen.
+
+### Fourth round: the VPU almost boots — PGCM, and the wall is a secure-world unlock
+
+This round got the VPU from "powered but silent" to "firmware in place, region
+configured, image authenticated, core released by TZ".  It ends at a
+secure-world prerequisite that mainline has no implementation for.  Status:
+
+    power-on / clocks / resets / IRQ          OK   (WRAPPER_INTR_MASK reads 0x1f6)
+    firmware placed in the PIL pool           OK   (qcom_mdt_load ret=0)
+    TZ region setup (PAS_MEM_SETUP)           OK
+    TZ image authentication (INIT_IMAGE)      OK
+    wrapper firmware window (FW/CPA regs)     BLOCKED - writes stall the bus
+    VIDEOCC AHB clock (iris_ahb)              BLOCKED - enable bit cannot be set
+    TZ core release (AUTH_AND_RESET)          BLOCKED - no safe way to program the above first
+
+**PGCM was the region blocker.**  `qcom_scm_pas_mem_setup()` returned `-EINVAL`
+for *every* address we tried - our own carve-out, the bootloader's 5 MB EFI
+reservation (`0x9ffb0000`), the TREE region (`0x9e400000`), and the pool bases.
+The Windows PIL driver's own configuration (read out of the SYSTEM hive with
+`tools/hive-dump.py`, which is a minimal read-only regf parser added this round)
+explains why:
+
+    \DriverDatabase\...\qcpil8180.inf...\Configurations\PIL_Device.NT\Device\PGCM
+        BaseAddress = 0x8bd80000      Size = 0x0e780000
+    ...\Device\PilConfig
+        HypProtectionEnabled = 0x1
+    ...\Device\SubsystemLoad\VENUS
+        MemoryAlignment = 0x0        MemoryReservation = 0x500000   (no fixed address)
+
+Every subsystem that *works* on this machine has its region inside that pool
+(`MPSS 0x8d800000`, `ADSP 0x90800000`, `CDSP 0x92400000`, `SLPI 0x92c00000` -
+all from the same registry tree), and every address we had tried was outside it.
+`0x8bd80000`, `0x9a000000` and `0x8c000000` all return `qcom_mdt_load ret=0`;
+`0x94000000` does not (the SLPI's 20 MB ends exactly there).  `video_mem` in
+`sc8180x.dtsi` now lives at `0x8bd80000` (5 MB) for that reason.  Note the
+reservation size (5 MB) equals the image footprint exactly, and the video
+firmware is allocated dynamically like the ADSP's - only MODEM has a pinned
+`MemoryAddress`.
+
+**Two more fixes came out of the vendor sources**
+
+* the node gained `VIDEO_CC_IRIS_AHB_CLK` (`"ahb"`), which the downstream PIL
+  node lists as a proxy clock together with `xo` and `core`, and the driver
+  enables it in `power_on_controller` (best effort, so other platforms are
+  unaffected);
+* `iris_vpu_boot_firmware()` had been writing two Venus-6xx-only registers
+  (`CPU_CS_H2XSOFTINTEN` 0x148, `CPU_CS_X2RPMH` 0x168).  `hfi_venus.c` writes
+  them only for IRIS2/IRIS2_1/AR50-lite; the Venus-4xx boot path stops after
+  `CTRL_INIT`.  Those writes are gone.
+
+**The two blockers, and why they are the same blocker**
+
+1. `iris_vpu_setup_fw_region()`, added this round, mirrors
+   `venus_reset_cpu()`'s non-IRIS2 path: it programs the wrapper's
+   `WRAPPER_FW_START/END_ADDR` (0x1028/0x102C), `WRAPPER_CPA_START/END_ADDR`
+   (0x1020/0x1024), `WRAPPER_NONPIX_START/END_ADDR` (0x1030/0x1034),
+   `WRAPPER_CPU_CGC_DIS` (0x2010), `WRAPPER_CPU_CLOCK_CONFIG` (0x2000) and
+   releases the CPU with `WRAPPER_A9SS_SW_RESET` (0x3000, `BIT(4)` holds it).
+   The vendor PIL node maps exactly this block (`reg = <0xaae0000 0x4000>`,
+   i.e. `0xE0000..0xE4000`), and the block is what TZ reads when it releases
+   the core - with it zeroed the core would fetch from address 0.
+   In practice **every store into that half of the wrapper stalls the bus**
+   (hard lock: caps-lock dead, no panic, no RCU stall report, empty pstore),
+   while the low window (`WRAPPER_INTR_STATUS/MASK` at 0x0C/0x10) reads and
+   writes normally.
+2. `video_cc_iris_ahb_clk` (VIDEOCC 0x8f4, `BIT(0)`, parent
+   `video_cc_iris_clk_src`) **cannot be enabled**: a raw write does not stick,
+   and neither does the clock framework's - which still reports success because
+   that branch's `halt_check` is `BRANCH_VOTED`, a modifier with no halt check
+   at all, so `clk_prepare_enable()` can never fail there.  The shared RCG
+   itself is fine (its enable lives in `CFG_REG`, not in `CMD_RCGR` bit 0, and
+   `mvsc_core`/`mvs0_core` run at the programmed 533 MHz), so the missing piece
+   is the AHB branch specifically - i.e. the VPU's register-interface clock.
+
+(1) and (2) are the same problem seen from two sides: the AHB clock gates the
+wrapper's upper window, and both are unreachable from the non-secure OS.
+
+**The wall** is therefore the secure-world handshake that the Windows PIL driver
+performs and mainline has no equivalent for.  From `qcpil8180.sys` (a KMDF WMI
+driver - it imports `IoWMIRegistrationControl` and contains no `smc`/`hvc`
+instruction, so the secure calls are issued through its TREE/"PIL-TZ" plumbing):
+
+    Tree ELF image authentication                       = Linux pas_init_image   (works)
+    Request to define relocatable subsystem memory      = Linux pas_mem_setup    (works)
+    Request to share subsystem memory                   - nothing in mainline
+    Request to unlock subsystem memory / XPU            - nothing in mainline
+
+The kernel's whole SCM surface is PIL `INIT_IMAGE 0x01`, `MEM_SETUP 0x02`,
+`AUTH_AND_RESET 0x05`, `SHUTDOWN 0x06`, `IS_SUPPORTED 0x07`, `MSS_RESET 0x0a`,
+plus `MP_VIDEO_VAR 0x08`, `MP_ASSIGN 0x16`, `SHM_BRIDGE_{CREATE,ENABLE,DELETE}`
+0x1c/0x1d/0x1e.  `PAS_IS_SUPPORTED` exists in the kernel but returns 0 for
+every id on this TZ (it is an older TZ revision than the kernel assumes).  Both
+the ACPI DSDT (`\_SB.SCM0` = QCOM040B, `\_SB.TREE` = QCOM0476 with a dynamic
+`TCMA/TCML` region, `\_SB.PILC` = QCOM041B) and the CSRT contain only resource
+*names* and vendor blobs - no PAS ids, no region addresses, no XPU permissions.
+
+**Who actually performs the unlock (resolved from the registry and the binaries)**
+
+Using `tools/hive-dump.py` on the SYSTEM hive, the ACPI devices map to services:
+
+    \Enum\ACPI\QCOM040B  ->  qcscm     (System32\DriverStore\...\qcscm8180.sys)
+    \Enum\ACPI\QCOM041B  ->  qcPILC    (qcpil8180.sys)
+    \Enum\ACPI\QCOM0476  ->  QcTrEE    (QcTrEE8180.sys)
+
+Both `qcscm8180.sys` and `QcTrEE8180.sys` contain **no `smc`/`hvc` instruction at
+all**.  Their strings show why: the secure calls are made through a
+hypervisor-mediated "TREE" target - `TreeOpenTarget` / `TreeSendIrp`, with
+`AllocMemFromTreeSMB` / `FreeMemFromTreeSMB` allocating the shared block - and
+they reference the TZ secure applications `qcom.tz.winsecapp` and
+`qcom.tz.uefisecapp`.  In other words the vendor's *share/unlock subsystem
+memory* is a **TZ secapp operation** reached through a Windows-only client
+stack, not an SIP SCM call that `qcom_scm` could simply mirror.  The only
+mainline call with comparable semantics is `qcom_scm_assign_mem()`
+(`SVC_MP`/`MP_ASSIGN 0x16`), whose VM and permission arguments are not
+derivable from anything we can read.
+
+That is the end of the Linux-reachable path: the blocker is a secure-world
+service with a Windows-side client.
+
+**Fifth round: the SCM path completes, and the reset comes from below Linux**
+
+With the wrapper window left to TZ (see the venus `use_tz` rule below) the trace
+finally runs all the way through the secure firmware handshake:
+
+    fw_load: name qcom/sc8180x/venus.mbn
+    set remote state (SCM call)
+    set remote state ret=-22          <- expected: venus tolerates -EINVAL here
+    fw region phys=0x8bd80000 size=5242880
+    qcom_mdt_load ret=0
+    PAS auth and reset (SCM call)
+    PAS auth ret=0                    <- TZ released the core
+    mem protect video var (SCM call)
+    boot_fw: ucregion map
+    boot_fw: CTRL_INIT write
+
+and then the machine resets.  Two details identify the failure: **pstore is
+empty** (no kernel panic, although `panic_on_rcu_stall=1` and ramoops were
+armed) and **journald never flushed the trace** even though `dmesg -w` showed it
+live.  A reset with no panic and no flushed log came from *below* Linux - the
+hypervisor/secure world or a hardware watchdog acting on a fault the OS cannot
+see.  That is the signature of a NoC/XPU-class event from the VPU, which the
+vendor driver handles explicitly (`FATAL:NOCErrInfo:
+VCODEC_NOC_ERR_ERRVLD_LOW_OFFS` in `qcdxkm8180.sys`), and it matches the DSDT
+engine manifest, which gives the video four pagetable sets (`VideoNonSecurePT`,
+`VideoSecurePT1..4`).  Those secure context banks belong to TZ; mainline can
+only declare the non-secure SID.
+
+**The `use_tz` rule, which cost a round to rediscover**
+
+    np = of_get_child_by_name(core->dev->of_node, "video-firmware");
+    if (!np) core->use_tz = true;                  /* TZ-managed firmware */
+
+    int venus_set_hw_state(struct venus_core *core, bool resume) {
+            if (core->use_tz)
+                    return qcom_scm_set_remote_state(resume, 0);  /* -EINVAL is fine */
+            if (resume)
+                    venus_reset_cpu(core);   /* WRAPPER_FW/CPA/NONPIX/CPU */
+    }
+
+i.e. the wrapper's firmware window (`0x1020`-`0x1034`, `0x2000`, `0x2010`,
+`0x3000`) is written **only when the firmware is not TZ-managed**.  On the
+secure flow it is TZ's register block, and stores to it **stall the bus** (hard
+lock, no panic).  An earlier attempt to write it "like venus does" therefore had
+to be removed, and `qcom_scm_set_remote_state(1, 0)` was added before the load
+instead.  The AR50 boot order from `venus_boot_core()` was also adopted: mask
+`WRAPPER_INTR_MASK` down to `0x8` (the V6-era `0x1f2` unmasks extra level
+sources), write the HFI-version register, then `CTRL_INIT`.
+
+**Artifacts added this round** (all under `tools/`, plus `windows-drivers/`)
+
+* `tools/hive-dump.py` - minimal read-only registry hive reader (regf/hbin/nk/
+  vk/lf/lh/li, ASCII and UTF-16 names).  It is what found PGCM and the per-
+  subsystem reservations.  Cell offsets are relative to the first hbin
+  (file offset 0x1000) - getting that wrong makes the walk return zero keys.
+* `tools/videocc-peek.py` - `/dev/mem` view of VIDEOCC/GCC with `dump`,
+  `gdsc-test`, `powerup`, `ahb-on`.  Its `clk_off(bit1)` annotation is wrong
+  (`CBCR_CLK_OFF` is bit 31); `scan`/VPU reads must not be used (they hang).
+* `tools/repack-venus-firmware.py` - shows why firmware repacking is a dead end:
+  clearing `QCOM_MDT_RELOCATABLE` and rebasing `p_paddr` makes the loader skip
+  the SCM call, but TZ then rejects the image one step earlier, i.e. the ELF
+  header and program-header table are part of what it authenticates.
+* `tools/update-probe-dtb.sh`, the `ramoops` node, and the persistent capture
+  recipe (`panic_on_rcu_stall=1`, `kernel.panic=20`, shortened
+  `rcu_cpu_stall_timeout`) - note a *NoC* wedge does not reach the panic path,
+  so a screen photo is still the fallback.
+* iris debug parameters: `fw_phys`, `fw_size`, `pas_id`, `fw_name`, `no_auth`,
+  `scan_pas`; and `skip_pas_mem_setup` on `mdt_loader`.  `mdt_loader` is loaded
+  from the initramfs, so replacing its .ko requires `mkinitcpio -P`.
+* `windows-drivers/` (qcpil8180 + qcdx8180 drivers and INFs) and
+  `~/acpi-dumps/` (DSDT/CSRT).
+
+**Traps that cost time this round, worth remembering**
+
+* a module installed in `/usr/lib/modules` is not the module that is running
+  until it is reloaded - check the build timestamp *and* a unique string from
+  the new build (the `[dbg=intclear1]` tag exists for exactly this);
+* `find ... -iname A -o -iname B -exec cp {} dir \;` applies `-exec` only to
+  `B`;
+* adding `WRAPPER_BASE_OFFS` to an offset macro that already contains it walks
+  off the end of the ioremap and produces a level-3 translation fault - a
+  *survivable* oops, unlike a bus stall, which is a hard lock;
+* a user-mode `/dev/mem` read of an unmapped VPU register can take the machine
+  down, while the same access from kernel context is an oops.
 
 ## Build note
 

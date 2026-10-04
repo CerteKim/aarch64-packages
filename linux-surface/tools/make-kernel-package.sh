@@ -53,17 +53,61 @@ PYEOF
 echo "==> stripping debug info"
 find "$M/kernel" -name "*.ko" -print0 | xargs -0 -r -n 8 strip --strip-debug
 
-echo "==> kernel image, metadata and DTB"
-install -Dm644 "$KSRC/arch/arm64/boot/Image" "$M/vmlinuz"
+echo "==> kernel image (gzip), metadata and DTBs"
+# The kernel image goes into the package *and* to /boot.  Shipping it matters:
+# "pacman -U" without it replaces every module while /boot keeps the previous
+# kernel, which leaves modules and kernel from different builds (the kernel
+# then rejects each module's BTF and services that depend on those modules
+# fail).  gzip keeps the package small; GRUB and mkinitcpio both handle it.
 install -Dm644 "$KSRC/System.map" "$M/System.map"
 install -Dm644 "$KSRC/.config" "$M/config"
 install -Dm644 "$KSRC/modules.order" "$M/modules.order"
 install -Dm644 "$KSRC/modules.builtin" "$M/modules.builtin"
 [ -f "$KSRC/modules.builtin.modinfo" ] && install -Dm644 "$KSRC/modules.builtin.modinfo" "$M/modules.builtin.modinfo"
 echo -n linux-mibook > "$M/pkgbase"
+gzip -9 -c "$KSRC/arch/arm64/boot/Image" > "$M/vmlinuz"
+install -Dm644 "$M/vmlinuz" "$STAGE/boot/vmlinuz-linux-mibook"
+
 install -Dm644 "$KSRC/arch/arm64/boot/dts/qcom/$DTB" "$M/dtb/qcom/$DTB"
-mkdir -p "$STAGE/boot/dtb/linux-mibook/qcom"
-cp "$M/dtb/qcom/$DTB" "$STAGE/boot/dtb/linux-mibook/qcom/"
+BDTB="$STAGE/boot/dtb/linux-mibook/qcom"
+mkdir -p "$BDTB"
+# Both GRUB-referenced paths get the parked (VPU node disabled) DTB, so a plain
+# package install can never make the machine probe the VPU.  The probe variant
+# is only copied over these paths by tools/probe-vdec-run.sh.
+cp "$M/dtb/qcom/$DTB" "$BDTB/$DTB"
+cp "$M/dtb/qcom/$DTB" "$BDTB/$(basename "$DTB" .dtb)-oc.dtb"
+install -Dm644 "$M/dtb/qcom/$DTB" "$BDTB/$(basename "$DTB" .dtb)-vdec-probe.dtb"
+fdtput -ts "$BDTB/$(basename "$DTB" .dtb)-vdec-probe.dtb" \
+    /soc@0/video-codec@aa00000 status okay
+
+echo "==> mkinitcpio preset and .INSTALL"
+# The preset must be shipped: it used to be owned by the previous package, so a
+# package that omits it makes pacman delete it, and then "mkinitcpio -P" fails
+# with "No presets found in /etc/mkinitcpio.d" and /boot keeps a stale
+# initramfs built from another kernel's modules.
+sed "s|%PKGBASE%|linux-mibook|g" "$REPO/linux-mibook.preset" \
+    | install -Dm644 /dev/stdin "$STAGE/etc/mkinitcpio.d/linux-mibook.preset"
+
+cat > "$STAGE/.INSTALL" <<'EOF'
+build_initramfs() {
+    if ! command -v mkinitcpio >/dev/null; then
+        echo "mkinitcpio not installed - skipping initramfs rebuild"
+        return 0
+    fi
+    if ls /etc/mkinitcpio.d/*.preset >/dev/null 2>&1; then
+        mkinitcpio -P && return 0
+        echo "mkinitcpio -P failed, falling back to an explicit build"
+    fi
+    mkinitcpio -k /boot/vmlinuz-linux-mibook -g /boot/initramfs-linux-mibook.img
+}
+post_install() {
+    depmod "$1" 2>/dev/null || true
+    build_initramfs
+}
+post_upgrade() {
+    post_install "$@"
+}
+EOF
 
 echo "==> depmod"
 ln -sfn usr/lib "$STAGE/lib"
@@ -91,11 +135,17 @@ optdepend = crda: to set the correct wireless channels of your country
 EOF
 
 echo "==> packaging"
-( cd "$STAGE" && bsdtar --zstd -cf "$PKG" .PKGINFO boot usr )
+# --uid/--gid 0: the staging tree is owned by the build user, and a package that
+# records uid 1000 would install kernel modules owned by a non-root user (which
+# that user could then modify and have root load) and makes pacman warn about
+# every /boot file.
+( cd "$STAGE" && bsdtar --zstd --uid 0 --gid 0 --uname root --gname root \
+    -cf "$PKG" .PKGINFO .INSTALL boot etc usr )
 rm -rf "${STAGE%/linux-mibook}"
 echo
 ls -la "$PKG"
 pacman -Qp "$PKG"
 echo
 echo "install with:  sudo pacman -U $PKG"
-echo "then refresh the ESP:  sudo $REPO/tools/refresh-boot-from-tree.sh"
+echo "the package ships /boot/vmlinuz-linux-mibook and the DTBs; use"
+echo "$REPO/tools/probe-vdec-run.sh for a verified, revertible probe install"

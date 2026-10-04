@@ -1,0 +1,191 @@
+diff --git a/drivers/media/platform/qcom/iris/iris_core.c b/drivers/media/platform/qcom/iris/iris_core.c
+index 8406c48d635b..85708e786476 100644
+--- a/drivers/media/platform/qcom/iris/iris_core.c
++++ b/drivers/media/platform/qcom/iris/iris_core.c
+@@ -59,28 +59,34 @@ int iris_core_init(struct iris_core *core)
+ 
+ 	core->state = IRIS_CORE_INIT;
+ 
++	dev_err(core->dev, "IRIS-TRACE: core_init: hfi queues\n");
+ 	ret = iris_hfi_queues_init(core);
+ 	if (ret)
+ 		goto error;
+ 
++	dev_err(core->dev, "IRIS-TRACE: core_init: vpu power_on\n");
+ 	ret = iris_vpu_power_on(core);
+ 	if (ret)
+ 		goto error_queue_deinit;
+ 
++	dev_err(core->dev, "IRIS-TRACE: core_init: firmware load\n");
+ 	ret = iris_fw_load(core);
+ 	if (ret)
+ 		goto error_power_off;
+ 
++	dev_err(core->dev, "IRIS-TRACE: core_init: boot firmware\n");
+ 	ret = iris_vpu_boot_firmware(core);
+ 	if (ret)
+ 		goto error_unload_fw;
+ 
++	dev_err(core->dev, "IRIS-TRACE: core_init: hfi core init\n");
+ 	ret = iris_hfi_core_init(core);
+ 	if (ret)
+ 		goto error_unload_fw;
+ 
+ 	mutex_unlock(&core->lock);
+ 
++	dev_err(core->dev, "IRIS-TRACE: core_init: waiting for sys response\n");
+ 	return iris_wait_for_system_response(core);
+ 
+ error_unload_fw:
+diff --git a/drivers/media/platform/qcom/iris/iris_firmware.c b/drivers/media/platform/qcom/iris/iris_firmware.c
+index 9ab499fad946..227ecc55098a 100644
+--- a/drivers/media/platform/qcom/iris/iris_firmware.c
++++ b/drivers/media/platform/qcom/iris/iris_firmware.c
+@@ -41,11 +41,13 @@ static int iris_load_fw_to_memory(struct iris_core *core, const char *fw_name)
+ 
+ 	mem_phys = rmem->base;
+ 	res_size = rmem->size;
++	dev_err(dev, "IRIS-TRACE: fw region phys=%pa size=%zu\n", &mem_phys, res_size);
+ 
+ 	ret = request_firmware(&firmware, fw_name, dev);
+ 	if (ret)
+ 		return ret;
+ 
++	dev_err(dev, "IRIS-TRACE: fw request ok, file size %zu\n", firmware->size);
+ 	fw_size = qcom_mdt_get_size(firmware);
+ 	if (fw_size < 0 || res_size < (size_t)fw_size) {
+ 		ret = -EINVAL;
+@@ -58,8 +60,10 @@ static int iris_load_fw_to_memory(struct iris_core *core, const char *fw_name)
+ 		goto err_release_fw;
+ 	}
+ 
++	dev_err(dev, "IRIS-TRACE: qcom_mdt_load (elf=%d) starting\n", fw_size);
+ 	ret = qcom_mdt_load(dev, firmware, fw_name,
+ 			    pas_id, mem_virt, mem_phys, res_size, NULL);
++	dev_err(dev, "IRIS-TRACE: qcom_mdt_load ret=%d\n", ret);
+ 
+ 	memunmap(mem_virt);
+ err_release_fw:
+@@ -79,18 +83,22 @@ int iris_fw_load(struct iris_core *core)
+ 	if (ret)
+ 		fwpath = core->iris_platform_data->fwname;
+ 
++	dev_err(core->dev, "IRIS-TRACE: fw_load: name %s\n", fwpath);
+ 	ret = iris_load_fw_to_memory(core, fwpath);
+ 	if (ret) {
+ 		dev_err(core->dev, "firmware download failed\n");
+ 		return -ENOMEM;
+ 	}
+ 
++	dev_err(core->dev, "IRIS-TRACE: PAS auth and reset (SCM call)\n");
+ 	ret = qcom_scm_pas_auth_and_reset(core->iris_platform_data->pas_id);
++	dev_err(core->dev, "IRIS-TRACE: PAS auth ret=%d\n", ret);
+ 	if (ret)  {
+ 		dev_err(core->dev, "auth and reset failed: %d\n", ret);
+ 		return ret;
+ 	}
+ 
++	dev_err(core->dev, "IRIS-TRACE: mem protect video var (SCM call)\n");
+ 	ret = qcom_scm_mem_protect_video_var(cp_config->cp_start,
+ 					     cp_config->cp_size,
+ 					     cp_config->cp_nonpixel_start,
+diff --git a/drivers/media/platform/qcom/iris/iris_resources.c b/drivers/media/platform/qcom/iris/iris_resources.c
+index cf32f268b703..31ef06becc49 100644
+--- a/drivers/media/platform/qcom/iris/iris_resources.c
++++ b/drivers/media/platform/qcom/iris/iris_resources.c
+@@ -3,6 +3,7 @@
+  * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
+  */
+ 
++#include <linux/clk-provider.h>
+ #include <linux/clk.h>
+ #include <linux/interconnect.h>
+ #include <linux/pm_domain.h>
+@@ -36,6 +37,7 @@ int iris_set_icc_bw(struct iris_core *core, unsigned long icc_bw)
+ 
+ 			core->icc_tbl[i].avg_bw = bw_kbps;
+ 
++	dev_err(core->dev, "IRIS-TRACE: icc_bulk_set_bw(%lu)\n", bw_kbps);
+ 			core->power.icc_bw = bw_kbps;
+ 			break;
+ 		}
+@@ -62,6 +64,7 @@ int iris_enable_power_domains(struct iris_core *core, struct device *pd_dev)
+ {
+ 	int ret;
+ 
++	dev_err(core->dev, "IRIS-TRACE: enable pd %s (opp vote first)\n", dev_name(pd_dev));
+ 	ret = dev_pm_opp_set_rate(core->dev, ULONG_MAX);
+ 	if (ret)
+ 		return ret;
+@@ -111,9 +114,13 @@ int iris_prepare_enable_clock(struct iris_core *core, enum platform_clk_type clk
+ 	struct clk *clock;
+ 
+ 	clock = iris_get_clk_by_type(core, clk_type);
+-	if (!clock)
++	if (!clock) {
++		dev_err(core->dev, "IRIS-TRACE: clock type %d not found in DT\n", clk_type);
+ 		return -EINVAL;
++	}
+ 
++	dev_err(core->dev, "IRIS-TRACE: enable clock %d (%s)\n", clk_type,
++		__clk_get_name(clock));
+ 	return clk_prepare_enable(clock);
+ }
+ 
+diff --git a/drivers/media/platform/qcom/iris/iris_vpu_common.c b/drivers/media/platform/qcom/iris/iris_vpu_common.c
+index bb98950e018f..d728683ca359 100644
+--- a/drivers/media/platform/qcom/iris/iris_vpu_common.c
++++ b/drivers/media/platform/qcom/iris/iris_vpu_common.c
+@@ -115,8 +115,10 @@ int iris_vpu_boot_firmware(struct iris_core *core)
+ {
+ 	u32 ctrl_init = BIT(0), ctrl_status = 0, count = 0, max_tries = 1000;
+ 
++	dev_err(core->dev, "IRIS-TRACE: boot_fw: ucregion map\n");
+ 	iris_vpu_setup_ucregion_memory_map(core);
+ 
++	dev_err(core->dev, "IRIS-TRACE: boot_fw: CTRL_INIT write\n");
+ 	writel(ctrl_init, core->reg_base + CTRL_INIT);
+ 	writel(0x1, core->reg_base + CPU_CS_SCIACMDARG3);
+ 
+@@ -131,6 +133,7 @@ int iris_vpu_boot_firmware(struct iris_core *core)
+ 		count++;
+ 	}
+ 
++	dev_err(core->dev, "IRIS-TRACE: boot_fw: ctrl_status=%#x count=%u\n", ctrl_status, count);
+ 	if (count >= max_tries) {
+ 		dev_err(core->dev, "error booting up iris firmware\n");
+ 		return -ETIME;
+@@ -341,10 +344,12 @@ int iris_vpu_power_on(struct iris_core *core)
+ 	if (ret)
+ 		goto err;
+ 
++	dev_err(core->dev, "IRIS-TRACE: power_on: controller (pds/clocks/resets)\n");
+ 	ret = core->iris_platform_data->vpu_ops->power_on_controller(core);
+ 	if (ret)
+ 		goto err_unvote_icc;
+ 
++	dev_err(core->dev, "IRIS-TRACE: power_on: hw (vcodec0 pd/clk)\n");
+ 	ret = core->iris_platform_data->vpu_ops->power_on_hw(core);
+ 	if (ret)
+ 		goto err_power_off_ctrl;
+@@ -352,13 +357,20 @@ int iris_vpu_power_on(struct iris_core *core)
+ 	freq = core->power.clk_freq ? core->power.clk_freq :
+ 				      (u32)ULONG_MAX;
+ 
++	dev_err(core->dev, "IRIS-TRACE: power_on: opp set_rate(%u)\n", freq);
+ 	dev_pm_opp_set_rate(core->dev, freq);
++	dev_err(core->dev, "IRIS-TRACE: power_on: opp done\n");
+ 
++	dev_err(core->dev, "IRIS-TRACE: power_on: preset regs (first VPU write)\n");
+ 	core->iris_platform_data->set_preset_registers(core);
++	dev_err(core->dev, "IRIS-TRACE: power_on: preset regs done\n");
+ 
++	dev_err(core->dev, "IRIS-TRACE: power_on: intr mask (VPU read)\n");
+ 	iris_vpu_interrupt_init(core);
++	dev_err(core->dev, "IRIS-TRACE: power_on: intr init done\n");
+ 	core->intr_status = 0;
+ 	enable_irq(core->irq);
++	dev_err(core->dev, "IRIS-TRACE: power_on: irq enabled\n");
+ 
+ 	return 0;
+ 
