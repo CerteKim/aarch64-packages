@@ -1775,23 +1775,33 @@ description is:
 
 `\_SB.PM01` (`_HID QCOM0430`, `_UID 1`) is the aggregate PMIC GPIO controller:
 one pin space covers the GPIOs of every PMIC, and its stride is not documented.
-Pin `0x0001` is certain — GPIO 1 of the first PMIC, which is exactly where the
-linux-surface Surface Pro X port (`4bc1a33`, "surface-pro-x: Add support for
-volume buttons") puts volume-down.  Pin `0x0085` has three readings, so the board
-DTS instantiates all three as separate input devices: whichever one fires
-identifies the wiring, and the other two then get removed.
 
-| probe | reading | Linux |
+The Surface Pro X dump in `aarch64-laptops/build/misc/microsoft-surface-prox`
+cracks it: its own button device (`\_SB.MSBT`, `MSHW0040`) declares the *same*
+three GpioInts on the same controller — `0x00`, `0x80` and `0x85` — and the
+linux-surface Surface Pro X port (`4bc1a33`, "surface-prox: Add support for
+volume buttons") maps its two volume keys to **GPIO 1 and GPIO 6 of the first
+PMIC**.  That fits a `0x7f + gpio` offset exactly (`0x7f + 1 = 0x80`,
+`0x7f + 6 = 0x85`), and `0x85` is the pin both machines share, so volume-up is
+the first PMIC's **GPIO 6**.  The board DTS therefore carries:
+
+| key | declared | first reading tried |
 | --- | --- | --- |
-| A | `(USID 8 << 4) \| 5` | `pmc8180_2_gpios` 5 |
-| B | `(USID 4 << 5) \| 5` | `pmc8180c_gpios` 5 |
-| C | `0x80 \| 5` | `pmc8180_1_gpios` 5 |
+| Volume Down | `pmc8180_1_gpios 1` | pin `0x0001` → first PMIC GPIO 1 |
+| Volume Up | `pmc8180_1_gpios 6` | pin `0x0085` → `0x7f + 6` (Surface Pro X match) |
+| Volume Up (alt) | `pmc8180_1_gpios 5` | pin `0x0085` → `0x80 + 5` |
 
-Test with `sudo evtest` (or `sudo libinput debug-events`): the device name in the
-event line names the probe that fired ("Volume Up probe A/B/C").  The pins are
-configured active-low with an internal pull-up, matching the Surface Pro X
-port; if a key reports the opposite of what is pressed, flip `GPIO_ACTIVE_LOW`
-(or the bias).
+Both volume-up readings are instantiated so that whichever fires identifies the
+offset; the other one is then removed.  Each is its own input device, so
+`evtest`'s device name ("Volume Up (pmc8180_1 gpio6)") says which one fired.
+
+The pins are configured active-low with an internal pull-up, matching the
+Surface Pro X port; if a key reports the opposite of what is pressed, flip
+`GPIO_ACTIVE_LOW` (or the bias).
+
+Note that `evtest` reporting no events can mean two different things, so check
+`dmesg | grep -iE "gpio-keys|gpio_keys"` first: no events from a device that did
+exist is a wrong pin, while no device at all is a failed GPIO/IRQ claim.
 
 ## Build note
 
