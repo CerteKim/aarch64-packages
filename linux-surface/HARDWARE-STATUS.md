@@ -1353,7 +1353,7 @@ upstream submission)
 | `skip_pas_mem_setup` | `mdt_loader` param | skip the TZ relocation call only |
 | `IRIS-TRACE:` breadcrumbs | iris `core/resources/vpu_common/firmware` | progress log |
 | VPU-free teardown | `iris_vpu_power_off_controller` | makes a failed probe survivable (it used to abort a second time and take the machine down) |
-| `tools/videocc-peek.py` | `dump`, `powerup`, `gdsc-test`, `scan`, ... | /dev/mem view of VIDEOCC/GCC; `scan` and VPU reads are **not** safe |
+| `debug/videocc-peek.py` | `dump`, `powerup`, `gdsc-test`, `scan`, ... | /dev/mem view of VIDEOCC/GCC; `scan` and VPU reads are **not** safe |
 
 Gotchas worth keeping:
 
@@ -1538,13 +1538,13 @@ instead.  The AR50 boot order from `venus_boot_core()` was also adopted: mask
 `WRAPPER_INTR_MASK` down to `0x8` (the V6-era `0x1f2` unmasks extra level
 sources), write the HFI-version register, then `CTRL_INIT`.
 
-**Artifacts added this round** (all under `tools/`, plus `windows-drivers/`)
+**Artifacts added this round** (under `tools/` and `debug/`, plus `windows-drivers/`)
 
 * `tools/hive-dump.py` - minimal read-only registry hive reader (regf/hbin/nk/
   vk/lf/lh/li, ASCII and UTF-16 names).  It is what found PGCM and the per-
   subsystem reservations.  Cell offsets are relative to the first hbin
   (file offset 0x1000) - getting that wrong makes the walk return zero keys.
-* `tools/videocc-peek.py` - `/dev/mem` view of VIDEOCC/GCC with `dump`,
+* `debug/videocc-peek.py` - `/dev/mem` view of VIDEOCC/GCC with `dump`,
   `gdsc-test`, `powerup`, `ahb-on`.  Its `clk_off(bit1)` annotation is wrong
   (`CBCR_CLK_OFF` is bit 31); `scan`/VPU reads must not be used (they hang).
 * `tools/repack-venus-firmware.py` - shows why firmware repacking is a dead end:

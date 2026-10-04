@@ -9,7 +9,7 @@
 #
 # These prebuilt panel DTBs only go to the stock path; the "-oc" name is a copy
 # of the same tree used by the default GRUB menu entry, so install the built
-# DTB into both names with tools/refresh-boot-from-tree.sh after switching.
+# DTB into both names with debug/refresh-boot-from-tree.sh after switching.
 # Note also that panel-dtb/*.dtb are snapshots from before the power-key,
 # volume-key and backlight work, so a build from the source tree is preferable.
 set -euo pipefail

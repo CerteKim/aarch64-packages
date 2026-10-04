@@ -71,7 +71,7 @@ echo "==> installing the DTB"
 #
 # Only the stock path is written: sc8180x-xiaomi-book-12.4-oc.dtb is the
 # overclocked GPU variant built by the kernel Makefile, not a copy of this
-# one.  Install it with tools/refresh-boot-from-tree.sh.
+# one.  Install it with debug/refresh-boot-from-tree.sh.
 install -Dm644 "$REPO/panel-dtb/sc8180x-xiaomi-book-12.4.single-link.dtb" \
     "$BOOT_DTB_DIR/${DTB}"
 
@@ -80,5 +80,5 @@ echo "Done."
 ls -la /boot/vmlinuz-linux-mibook /boot/initramfs-linux-mibook.img "$BOOT_DTB_DIR/"
 df -h /boot | tail -1
 echo
-echo "Reboot and pick the 'Arch Linux' GRUB entry, then run verify-mainline-panel.sh."
+echo "Reboot and pick the 'Arch Linux' GRUB entry, then run debug/verify-mainline-panel.sh."
 echo "To roll back: sudo ./tools/restore-single-dsi-panel.sh"
