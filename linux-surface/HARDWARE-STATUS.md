@@ -1926,9 +1926,140 @@ build fails in `tools/bpf/resolve_btfids`.
 
 Confirmed working on hardware 2026-10-03 — but the last hurdle was **gain, not
 routing**. `Speaker Digital Volume` (the ctl-remap of `RX7/RX8 Digital
-Volume`, `-84 dB .. 0 dB`, raw 0..124) had ended up very low, which is
-inaudible no matter how correct the routing is. Raising it to full in
-`alsamixer` produced sound immediately.
+Volume`) had ended up very low, which is inaudible no matter how correct the
+routing is. Raising it in `alsamixer` produced sound immediately.
+
+**Read the dB scale before trusting "full".** The control is
+`SOC_SINGLE_S8_TLV(..., -84, 40, digital_gain)`, i.e. a *signed* value in dB:
+raw 0 = -84 dB, **raw 84 = 0 dB**, raw 124 = **+40 dB**. The user-visible range
+0..124 is the signed value offset by 84, so the top of the range is 40 dB
+*above* 0 dBFS, not "full scale". alsa-lib reports this directly:
+
+```
+$ amixer -c 0 sget 'Speaker Digital'
+  Limits: 0 - 124
+  Front Left: 124 [100%] [40.00dB]
+$ amixer -c 0 sget 'HP Digital'
+  Front Left:  82 [ 66%] [-2.00dB]      # the headphone path, for comparison
+```
+
+`alsactl` records the same thing (`dbvalue.0 4000` for RX7/RX8). Upstream agrees
+on where 0 dB is: `codecs/qcom-lpass/rx-macro/init.conf` sets its RX macro
+volumes to 84, and `codecs/wcd934x/init.conf` sets RX1/RX2/RX7/RX8 to 80
+(-4 dB).
+
+### The S24_LE speaker backend was the quiet path (root cause, 2026-10-05)
+
+The obvious reading of the above — "124 is overdrive, 84 is full scale, so use
+84" — is **wrong here, and acting on it silences the machine completely.** This
+box genuinely needed all 40 dB, because the playback path was 20-48 dB down.
+
+Root cause: `sdm845_be_hw_params_fixup()` pinned `SLIMBUS_0_RX` to `S24_LE` for
+this machine, on the strength of the Windows ACDB declaring the built-in
+speaker topology as 48 kHz/24-bit (`8592f84cf7ba`). That reading is wrong end
+to end. Measured on hardware with `RX7/RX8 Digital Volume` held at a fixed
++20 dB, playing the same -12 dBFS 880 Hz tone as raw PCM straight to `hw:0,0`:
+
+| front end | result |
+|---|---|
+| `S16_LE` | clearly audible |
+| `S24_LE` | **not audible at all** |
+
+One byte of misalignment, 20-48 dB. And because PipeWire picks the front-end
+format from the advertised backend constraints, **every** player ended up on
+the quiet path (`hw_params: format: S24_LE`). The only way to get usable sound
+out was to push the RX digital volumes to their +40 dB maximum, which then
+squared off anything loud — the "quieter than Windows, with the occasional
+crackle" this machine had been living with since the first bring-up.
+
+Fixed in `57de82c7de84` by keeping the generic `S16_LE` (the 48 kHz /
+2-channel constraints, which the ACDB reading did get right, are unchanged),
+plus the 0 dB cap in `ff4dc28f8045`. **The cap is only correct once the format
+is right** — while the path was still 20-48 dB down it removed the gain the
+machine was living on and made the speakers completely silent.
+
+### The backend alone was not enough: the front end has to be 16-bit too
+
+`57de82c7de84` pins the *backend*. That is necessary but not sufficient,
+because the front ends advertise S16/S24/S32 and **ACP picks S24_LE from that
+set on its own** — the node property `audio.format` does not override it
+(a WirePlumber rule setting it was tried and did nothing). So every player
+still landed on the quiet path; `hw_params` read `format: S24_LE` even with
+the backend already forced to `S16_LE`, and PipeWire playback at 0 dB was
+silent while `aplay -f S16_LE` at the same gain was audible.
+
+`430e0dbdb508` fixes it where it belongs, in `sdm845_fe_startup()`: the
+playback front ends of this machine are constrained to `S16_LE`, so the choice
+is not left to the sound server. Playback only — capture has its own,
+separate quirk (see the microphone section).
+
+So the complete fix is three commits, and they only work together:
+
+| commit | what |
+|---|---|
+| `57de82c7de84` | `SLIMBUS_0_RX` backend back to the mainline `S16_LE` |
+| `430e0dbdb508` | playback front ends narrowed to `S16_LE` |
+| `ff4dc28f8045` | RX1/RX2/RX7/RX8 capped at 84 = 0 dB (correct *because* of the two above) |
+
+Verify with `tools/audio-level-test.sh`, which pins 0 dB and plays straight to
+the hardware: audible at 0 dB means the level is right. Then check that
+PipeWire agrees — `grep format /proc/asound/card0/pcm0p/sub0/hw_params` while
+something plays should now read `S16_LE`, not `S24_LE`.
+
+### Verified on hardware 2026-10-05
+
+With `57de82c7de84` + `430e0dbdb508` + `ff4dc28f8045` loaded and the stock
+`wsa881x` driver, everything finally reads the way it should, and it sounds
+loud and clean at 0 dB — with no +40 dB of digital gain anywhere:
+
+```
+$ amixer -c 0 sget 'Speaker Digital'
+  Limits: 0 - 84
+  Front Left: 84 [100%] [0.00dB]
+$ grep format /proc/asound/card0/pcm0p/sub0/hw_params
+  format: S16_LE
+$ cat /sys/bus/soundwire/devices/sdw:0:0:0217:2110:00:{3,4}/status
+  Attached
+  Attached
+```
+
+`format: S16_LE` is the one that matters — that is the fingerprint of this
+whole bug, and it read `S24_LE` on every previous attempt.
+
+### The amplifier power-up race is what actually breaks the machine
+
+Worth keeping separate from all of the above, because it bit hard during this
+debugging: our own PA-gain patch (`cecbd35ca830`) adds a bus access at
+`SND_SOC_DAPM_PRE_PMU`, and the SoundWire analysis calls that an **aggravator**
+of the amplifier power-up race. When that race is lost the amplifier ends up
+stuck, and the failure is total rather than merely quiet:
+
+```
+wsa881x-codec sdw:0:0:0217:2110:00:4: Initialization not complete, timed out
+wsa881x-codec sdw:0:0:0217:2110:00:4: ASoC error (-110) at ...pm_runtime_get()
+SLIM Playback:                          ASoC error (-110) at __soc_pcm_open()
+MultiMedia1:                            ASoC error (-110) at dpcm_fe_dai_startup()
+...
+sdw:0:0:0217:2110:00:4  UNATTACHED  power/runtime_status = error
+```
+
+The card still registers, but the amps are off the bus, WirePlumber can only
+offer `Dummy Output`, and no PCM can be opened at all — so there is no sound
+anywhere, which reads like a far worse bug than it is. Recovery is a reboot;
+`tools/install-amp-variant.sh h1a` removes the failure mode (and the pops) by
+never power-cycling the amplifier. `tools/install-amp-variant.sh` switches
+between the three variants, and the default install uses the *stock* driver on
+purpose.
+
+### Correction: an earlier revision of this file got this backwards
+
+It previously claimed `124` was "squared off" overdrive, that "84 was already
+loud", and that "**0 dB (84) is the correct maximum for this control**" — with
+an A/B test cited as evidence. That A/B rested on a mis-heard answer, and the
+claim was wrong: at 84 the speakers are inaudible on this machine (pre-format
+fix). The wrong conclusion then drove a kernel patch that muted the machine for
+hours while the mixer, DAPM and DSP all read correctly. Recorded here so the
+same reasoning is not repeated.
 
 Why the desktop volume slider does not help: the UCM verb declares
 `PlaybackMixerElem "Speaker"` / `"HP"`, but the remapped controls are named
@@ -1943,12 +2074,27 @@ happens to be. Two consequences:
 * software volume at 100% can still be silent if the hardware gain is low.
 
 Fix in this tree: `ucm2/Qualcomm/xiaomi-book-12.4/HiFi.conf`, a copy of
-`/Qualcomm/sdm845/HiFi-MM1.conf` with the element names corrected. Caveat: the
-remapped controls are **write-only** (`access=rw---R--`), so the ALSA
-simple-mixer layer does not list them (`amixer scontrols` shows no volume
-controls at all) and WirePlumber may still refuse them. If so, the pragmatic
-answer is to pin the gain (`alsactl store`, or `amixer -c 0 cset numid=2 124`)
-rather than rely on the desktop slider.
+`/Qualcomm/sdm845/HiFi-MM1.conf` with the element names corrected.
+
+**The remaining name bug (found 2026-10-05).** `PlaybackMixerElem` takes the
+*simple-mixer* element name, which is the control name with a trailing
+`" Volume"` / `" Switch"` stripped — compare every other profile, which writes
+`PlaybackMixerElem "Headphone"`, `"Digital PCM"`, `"Line Out"`. Our file wrote
+the full control name, so the lookup failed:
+
+```
+$ amixer -c 0 sget 'Speaker Digital'          # the element that exists
+  Capabilities: volume
+  Front Left: 84 [68%] [0.00dB]
+$ amixer -c 0 sget 'Speaker Digital Volume'
+amixer: Unable to find simple control 'Speaker Digital Volume',0
+```
+
+The earlier conclusion that the control was refused because it is write-only
+was **wrong**: the remapped control reads back fine (`Capabilities: volume`,
+and `amixer scontrols` does list `Speaker Digital`). It is only the name that
+does not resolve. Use `PlaybackMixerElem "Speaker Digital"` and
+`"HP Digital"`.
 
 ### Disproven along the way
 
@@ -1962,30 +2108,94 @@ rather than rely on the desktop slider.
 * **alsa state restore** — a full `alsactl` diff during a PipeWire stream shows
   no mixer changes, so nothing was mutating the routing mid-stream.
 
-### Outcome of the volume-element fix (tested)
+### Outcome of the volume-element fix (re-tested 2026-10-05)
 
-The corrected verb **is** in use — WirePlumber's warning now names
+The corrected verb **is** in use — WirePlumber's warning named
 `Path Speaker Digital Volume`, proving the UCM parsed our file rather than the
-upstream one. But it still refuses the control:
+upstream one — but it still refused the control. The explanation recorded here
+originally (the ctl-remap creates a write-only control with `access=rw---R--`,
+so the simple mixer cannot represent it) was **wrong**. The control is read
+back happily; the real cause was the element name. `PlaybackMixerElem` takes
+the *simple-mixer* name, i.e. the control name with the trailing `" Volume"`
+stripped, so it has to be `"Speaker Digital"` / `"HP Digital"`.
 
-    spa.alsa: Path Speaker Digital Volume is not a volume or mute control
+Verified against a live WirePlumber, without installing anything, by pointing
+the session at an overlay copy of ucm2:
 
-Root cause of that refusal: the ctl-remap creates the merged volume with
-`access=rw---R--`, i.e. **write-only**. The ALSA simple-mixer layer (which
-WirePlumber and PulseAudio use) cannot represent a volume it cannot read, so
-the element is invisible to them regardless of its name. `amixer scontrols`
-lists no volume controls at all on this card for the same reason.
+    systemctl --user set-environment ALSA_CONFIG_UCM2=/tmp/ucm-overlay
+    systemctl --user restart wireplumber pipewire
+    # -> neither device logs "not a volume or mute control" any more
 
-Therefore: **the desktop volume slider cannot drive the hardware gain on this
-machine.** This is an alsa-lib/remap limitation, not something a UCM profile
-can fix. The workable approach is to pin the gain:
+and that it is a genuine hardware handover, because moving the desktop slider
+now moves the codec register (nothing was playing, so nothing was heard):
 
-    amixer -c 0 cset numid=2 124      # Speaker Digital Volume, full scale
+    wpctl 0.2 -> Speaker Digital 83  [ -1.00 dB]
+    wpctl 0.4 ->                101  [+17.00 dB]
+    wpctl 0.6 ->                111  [+27.00 dB]
+    wpctl 0.8 ->                119  [+35.00 dB]
+    wpctl 1.0 ->                124  [+40.00 dB]
+
+Which exposes the second trap: with the control exposed as-is, **100% on the
+slider means +40 dB** and the useful part of the travel is the bottom fifth. So
+the name fix alone is not a fix — it just moves the overdrive out of
+`asound.state` and into the user's hands. Three changes therefore belong
+together, and all are in this tree:
+
+1. `ucm2/Qualcomm/xiaomi-book-12.4/HiFi.conf`: `PlaybackMixerElem` uses the
+   simple-mixer names, so the desktop slider drives the real hardware gain.
+2. `sdm845.c`: caps `RX1/RX2/RX7/RX8 Digital Volume` at 84 (0 dB) on this
+   machine, the same way `sc8280xp.c` caps the WSA macro volumes. With the cap
+   the slider's whole travel is useful and 100% is exactly 0 dB.
+   (`e7ca760822ae` "ASoC: qcom: sdm845: cap the Xiaomi Book 12.4 playback
+   volumes at 0 dB" — `snd_soc_limit_volume()` locates the control by exact
+   name and clamps in the same 0..124 space userspace sees, so 84 is 0 dB.)
+3. `wsa881x.c`: keeps the user's `SpkrLeft/Right PA Volume` across DAPM
+   power-up, so the amplifier gain the UCM asks for (+18 dB) is not rewritten
+   back to +12 dB on every stream start. (`cecbd35ca830` "ASoC: wsa881x: keep
+   the user PA gain across DAPM power-up".)
+
+The PA-gain reset is easy to reproduce **without making any sound**, because
+DAPM powers the amplifier up on stream start regardless of the content:
+
+    # right after WirePlumber has applied the Speaker enable sequence
+    amixer -c 0 cget numid=4        # SpkrLeft PA Volume -> 12  (+18 dB)
+    aplay -D hw:0,0 silence.wav     # 2 s of digital silence
+    amixer -c 0 cget numid=4        # -> 8  (+12 dB)  <- gain lost
+
+Measured exactly like that on 2026-10-05. Note the mixer *cache* is what
+reports 8: `wsa881x_pre_pmu_pa_2_0[]` writes `SPKR_DRV_GAIN` through regmap,
+so the control read back follows the hardware rather than what was asked for.
+
+`tools/audio-fix-install.sh` installs the three pieces, `depmod`s, pins the
+stored gain at 0 dB and re-stores it. All of it takes effect on the next
+reboot.
+
+Until the patched machine driver is loaded, pin the stored gain at 0 dB:
+
+    amixer -c 0 cset numid=2 84       # Speaker Digital Volume, 0 dB (RX7/RX8)
     sudo alsactl store                # persist across reboots
 
-Note the UCM BootSequence (`/codecs/wcd934x/init.conf`) also sets
-`RX7/RX8 Digital Volume` to 80 (-4 dB) whenever the card is enabled, which is
-audible; the value above is worth applying only if you want full scale.
+**Do not use 124** — that is +40 dB, not "full scale". `init.conf` also declares
+a `BootSequence` setting `RX7/RX8 Digital Volume` to 80 (-4 dB) whenever the
+card is enabled; whether alsa-lib applies that in UCM2 is unverified (the value
+actually observed in the register came from `asound.state`), but 80 is a sane
+value in any case.
+
+### Known remaining audio fault: SoundWire pops and the clash storm
+
+The `Slave N state check1: UNATTACHED` lines (~30/day) and the 68-second
+`Bus clash detected` storm (10,513 lines at 08:24:30–08:25:38) are investigated
+in [soundwire-pops-report.md](soundwire-pops-report.md). Summary: the master's
+clash report is effectively one-shot per resume cycle, the slave alert path has
+a bounded retry loop but no recovery at all, and the UNATTACHED lines are a
+transition-triggered bookkeeping mismatch on a *real* detach/attach cycle,
+because runtime PM physically powers the amplifiers down
+(`wsa881x_runtime_suspend()` asserts `SD_N`) while the master is still running.
+Deliberate silent-stream, service-restart and sample-rate experiments did
+**not** reproduce either message, which is consistent with the transition guard
+rather than with a per-stream fault. Ranked fixes with their trade-offs are in
+that file; **none is applied yet** — the smallest is to stop
+`wsa881x_runtime_suspend()` from asserting `SD_N`.
 
 ### Lessons / gotchas hit during this bring-up
 
