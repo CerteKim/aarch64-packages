@@ -1,16 +1,18 @@
 [Unit]
 Description=Set the WCN3998 Bluetooth BD address
-Documentation=file:///home/certe/aarch64-packages/linux-surface/systemd/bluetooth-bdaddr.sh
-# The controller only exists once bluetoothd has attached and powered it up
-# enough for the kernel to see hci0, but the address has to be in place before
-# bluetoothd actually uses the controller.
-After=bluetooth.service
-Wants=bluetooth.service
+Documentation=file:///usr/local/bin/bluetooth-bdaddr.sh
+# The controller only exists once the UART attach and the QCA setup are done;
+# the script waits for that itself, so there is no ordering against
+# bluetooth.service here.  bluetoothd picks the controller up as soon as the
+# address has been accepted and the index turns into a configured one.
 ConditionPathIsDirectory=/sys/class/bluetooth
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+# The script waits up to 20 s for hci0 and then retries the mgmt command for
+# another ~45 s, because hci0 is visible well before it is configurable.
+TimeoutStartSec=120
 ExecStart=/usr/local/bin/bluetooth-bdaddr.sh
 
 [Install]
