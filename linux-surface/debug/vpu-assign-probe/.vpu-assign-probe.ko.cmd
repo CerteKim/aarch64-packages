@@ -1,0 +1,1 @@
+savedcmd_vpu-assign-probe.ko := ld -r -EL  -maarch64elf -z noexecstack --no-warn-rwx-segments --build-id=sha1  -T /home/certe/aarch64-packages/linux-surface/src/kernel/scripts/module.lds -o vpu-assign-probe.ko vpu-assign-probe.o vpu-assign-probe.mod.o .module-common.o

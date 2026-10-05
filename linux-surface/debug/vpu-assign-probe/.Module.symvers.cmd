@@ -1,0 +1,1 @@
+savedcmd_Module.symvers :=  /home/certe/aarch64-packages/linux-surface/src/kernel/scripts/mod/modpost -M          -o Module.symvers -n -T modules.order -i /home/certe/aarch64-packages/linux-surface/src/kernel/Module.symvers -e 
