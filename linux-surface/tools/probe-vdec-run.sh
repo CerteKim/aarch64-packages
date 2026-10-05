@@ -91,10 +91,20 @@ echo "==> 3/6 kernel package (pkgrel $PKGREL)"
 CUR_A="$(gzip -dc /boot/vmlinuz-linux-mibook 2>/dev/null | md5sum | cut -d' ' -f1)"
 TREE_B="$(md5sum "$K/arch/arm64/boot/Image" | cut -d' ' -f1)"
 IRIS_KO="/usr/lib/modules/$KVER/kernel/drivers/media/platform/qcom/iris/qcom-iris.ko"
+KO_MEMBER="usr/lib/modules/$KVER/kernel/drivers/media/platform/qcom/iris/qcom-iris.ko"
 CUR_OWN="$(stat -c %u "$IRIS_KO" 2>/dev/null || echo none)"
+# Compare the installed module against the copy inside the package, byte for
+# byte.  The iris module is what most of these rebuilds change, and a
+# module-only rebuild leaves the kernel image byte-identical - so a check that
+# only looks at /boot/vmlinuz and file ownership says "already this build" and
+# the probe silently runs the *previous* module.  mtimes are not usable here
+# (the package's copy is stripped, which rewrites it), the bytes are.
+PKG_KO_SUM="$(bsdtar -xOf "$PKG" "$KO_MEMBER" 2>/dev/null | sha256sum | cut -d' ' -f1)"
+CUR_KO_SUM="$(sha256sum "$IRIS_KO" 2>/dev/null | cut -d' ' -f1)"
 if [ "$CUR_A" = "$TREE_B" ] && [ /boot/initramfs-linux-mibook.img -nt /boot/vmlinuz-linux-mibook ] \
-   && [ "$CUR_OWN" = "0" ]; then
-    echo "    already this build (kernel matches, initramfs newer, modules root-owned)"
+   && [ "$CUR_OWN" = "0" ] && [ -n "$PKG_KO_SUM" ] && [ "$PKG_KO_SUM" = "$CUR_KO_SUM" ]; then
+    echo "    already this build (kernel matches, initramfs newer, modules root-owned,"
+    echo "    installed iris module is the one in $PKG)"
     echo "    skipping the package install"
 else
     pacman -U --noconfirm "$PKG"
@@ -144,6 +154,15 @@ if [ "$OWNER" = "0" ]; then
     echo "    ok   module files are owned by root"
 else
     echo "    FAIL module files are owned by uid $OWNER (packaging bug - reinstall)"; fail=1
+fi
+KO_NOW="$(sha256sum "$IRIS_KO" 2>/dev/null | cut -d' ' -f1)"
+if [ -n "$PKG_KO_SUM" ] && [ "$PKG_KO_SUM" = "$KO_NOW" ]; then
+    echo "    ok   installed iris module is the one in $PKG"
+else
+    echo "    FAIL the installed iris module is NOT the one in $PKG"
+    echo "         package   ${PKG_KO_SUM:-<not readable>}"
+    echo "         installed ${KO_NOW:-<not readable>}"
+    echo "         the package was not installed - run: sudo pacman -U $PKG"; fail=1
 fi
 
 echo "==> 6/6 result"

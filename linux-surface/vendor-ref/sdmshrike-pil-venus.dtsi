@@ -1,0 +1,193 @@
+/*
+ * Excerpts from the CodeLinaro vendor tree for sdmshrike (= SC8180X), the
+ * SoC in this laptop.  Verbatim lines, only the line ranges are trimmed.
+ *
+ * Source: git.codelinaro.org/clo/la/kernel/msm-4.14
+ *         branch auto-kernel.lnx.4.14.c34
+ *         commit 9366ea378de5bec62ef449f31aad85be573a1e50
+ *
+ *   [1] arch/arm64/boot/dts/qcom/sdmshrike.dtsi:1910-1937  (pil_venus)
+ *   [2] arch/arm64/boot/dts/qcom/sdmshrike.dtsi:603-607    (pil_video_mem)
+ *   [3] arch/arm64/boot/dts/qcom/sdmshrike.dtsi:1601-1610  (videocc = v2)
+ *   [4] drivers/media/platform/msm/vidc/msm_vidc_platform.c:854-861
+ *   [5] drivers/media/platform/msm/vidc/venus_hfi.c:4653-4694
+ *   [6] drivers/media/platform/msm/vidc/venus_hfi.c:5054-5090 (NoC error block)
+ *   [7] drivers/soc/qcom/subsys-pil-tz.c:655-692 (PAS_MEM_SETUP / AUTH_AND_RESET)
+ */
+
+/* ------------------------------------------------------------------ [1]
+ * The video subsystem is NOT brought up by the vidc driver.  A separate
+ * qcom,pil-tz-generic node owns the wrapper window and the PAS, and it
+ * states both the PAS id (9) and the firmware region.
+ */
+	pil_venus: qcom,venus@aae0000 {
+		compatible = "qcom,pil-tz-generic";
+		reg = <0xaae0000 0x4000>;
+
+		vdd-supply = <&mvsc_gdsc>;
+		qcom,proxy-reg-names = "vdd";
+		qcom,complete-ramdump;
+
+		clocks = <&clock_videocc VIDEO_CC_XO_CLK>,
+			<&clock_videocc VIDEO_CC_MVSC_CORE_CLK>,
+			<&clock_videocc VIDEO_CC_IRIS_AHB_CLK>;
+		clock-names = "xo", "core", "ahb";
+		qcom,proxy-clock-names = "xo",  "core", "ahb";
+
+		qcom,core-freq = <200000000>;
+		qcom,ahb-freq = <200000000>;
+
+		qcom,pas-id = <9>;
+		qcom,msm-bus,name = "pil-venus";
+		qcom,msm-bus,num-cases = <2>;
+		qcom,msm-bus,num-paths = <1>;
+		qcom,msm-bus,vectors-KBps =
+			<63 512 0 0>,
+			<63 512 0 304000>;
+		qcom,proxy-timeout-ms = <100>;
+		qcom,firmware-name = "venus";
+		memory-region = <&pil_video_mem>;
+	};
+
+/* ------------------------------------------------------------------ [2]
+ * Fixed 5 MB no-map carve-out, immediately above the modem's 150 MB region.
+ * 0x8d800000 + 0x9600000 = 0x96e00000.
+ */
+		pil_video_mem: pil_video_region@0x96e00000 {
+			compatible = "removed-dma-pool";
+			no-map;
+			reg = <0x0 0x96e00000 0x0 0x500000>;
+		};
+
+/* ------------------------------------------------------------------ [3]
+ * The "_v2" string selects the 240/338/444/533 MHz table, i.e. the OPP set
+ * the mainline tree already carries for sc8180x.
+ */
+	clock_videocc: qcom,videocc@ab00000 {
+		compatible = "qcom,videocc-sm8150-v2", "syscon";
+		reg = <0xab00000 0x10000>;
+		reg-names = "cc_base";
+		vdd_mm-supply = <&VDD_MMCX_LEVEL>;
+		clock-names = "cfg_ahb_clk";
+		clocks = <&clock_gcc GCC_VIDEO_AHB_CLK>;
+		#clock-cells = <1>;
+		#reset-cells = <1>;
+	};
+
+/* ------------------------------------------------------------------ [4]
+ * sdmshrike shares sm8150's codec data and is VPU_VERSION_5, i.e. the same
+ * generation as sm8150 -- which downstream still programs with the
+ * "Venus 4xx" register map in vidc_hfi_io.h.
+ */
+static struct msm_vidc_platform_data sdmshrike_data = {
+	.codec_data = sm8150_codec_data,
+	.codec_data_length =  ARRAY_SIZE(sm8150_codec_data),
+	.common_data = sm8150_common_data,
+	.common_data_length =  ARRAY_SIZE(sm8150_common_data),
+	.ubwc_config = sdmshrike_ubwc_data,
+	.ubwc_config_length = ARRAY_SIZE(sdmshrike_ubwc_data),
+	...
+	.vpu_ver = VPU_VERSION_5,
+};
+
+/* ------------------------------------------------------------------ [5]
+ * The vpu5 interrupt mask is a read-modify-write that clears ONLY the CPU and
+ * watchdog bits.  From the 0x1f6 reset value that is 0x1e2 -- it is NOT
+ * narrowed to the vpu4 value 0x8 (WRAPPER_INTR_MASK_A2HVCODEC_BMSK).
+ *
+ * clock_config_on_enable_vpu5 also writes WRAPPER_CPU_CGC_DIS and
+ * WRAPPER_CPU_CLOCK_CONFIG (0xE2010 / 0xE2000), i.e. those two registers in
+ * the "upper" wrapper window are ordinary driver registers, unlike the
+ * FW/CPA window (0xE1020-0xE1034) and A9SS_SW_RESET (0xE3000), which the
+ * vendor kernel never touches for sdmshrike -- they belong to TZ/PAS.
+ *
+ * The bit definitions from vidc_hfi_io.h:105-110 that the two functions
+ * below use (see the verbatim copy in vidc_hfi_io.h in this directory):
+ *
+ *   VIDC_WRAPPER_INTR_MASK_A2HWD_BMSK     0x10   BIT(4)   <- watchdog
+ *   VIDC_WRAPPER_INTR_MASK_A2HVCODEC_BMSK 0x08   BIT(3)
+ *   VIDC_WRAPPER_INTR_MASK_A2HCPU_BMSK    0x04   BIT(2)
+ *   (reset value of VIDC_WRAPPER_INTR_MASK is 0x1f6)
+ */
+static void interrupt_init_vpu5(struct venus_hfi_device *device)
+{
+	u32 mask_val = 0;
+
+	/* All interrupts should be disabled initially 0x1F6 : Reset value */
+	mask_val = __read_register(device, VIDC_WRAPPER_INTR_MASK);
+
+	/* Write 0 to unmask CPU and WD interrupts */
+	mask_val &= ~(VIDC_WRAPPER_INTR_MASK_A2HWD_BMSK |
+			VIDC_WRAPPER_INTR_MASK_A2HCPU_BMSK);
+	__write_register(device, VIDC_WRAPPER_INTR_MASK, mask_val);
+}
+
+static void interrupt_init_vpu4(struct venus_hfi_device *device)
+{
+	__write_register(device, VIDC_WRAPPER_INTR_MASK,
+			VIDC_WRAPPER_INTR_MASK_A2HVCODEC_BMSK);  /* == 0x8 */
+}
+
+static void clock_config_on_enable_vpu5(struct venus_hfi_device *device)
+{
+	__write_register(device, VIDC_WRAPPER_CPU_CGC_DIS, 0);
+	__write_register(device, VIDC_WRAPPER_CPU_CLOCK_CONFIG, 0);
+}
+
+static struct venus_hfi_vpu_ops vpu4_ops = {
+	.interrupt_init = interrupt_init_vpu4,
+	.setup_dsp_uc_memmap = NULL,
+	.clock_config_on_enable = NULL,
+};
+
+static struct venus_hfi_vpu_ops vpu5_ops = {
+	.interrupt_init = interrupt_init_vpu5,
+	.setup_dsp_uc_memmap = setup_dsp_uc_memmap_vpu5,
+	.clock_config_on_enable = clock_config_on_enable_vpu5,
+};
+
+/* ------------------------------------------------------------------ [6]
+ * VCODEC NoC error block, at vidc base + 0x4000 (core0) / + 0xC000 (CVP).
+ * The vendor driver dumps this whenever a NOC_ERROR HFI response arrives.
+ */
+#define VCODEC_CORE0_VIDEO_NOC_BASE_OFFS		0x00004000
+#define CVP_NOC_BASE_OFFS				0x0000C000
+#define VCODEC_COREX_VIDEO_NOC_ERR_SWID_LOW_OFFS	0x0500
+#define VCODEC_COREX_VIDEO_NOC_ERR_SWID_HIGH_OFFS	0x0504
+#define VCODEC_COREX_VIDEO_NOC_ERR_MAINCTL_LOW_OFFS	0x0508
+#define VCODEC_COREX_VIDEO_NOC_ERR_ERRVLD_LOW_OFFS	0x0510
+#define VCODEC_COREX_VIDEO_NOC_ERR_ERRCLR_LOW_OFFS	0x0518
+#define VCODEC_COREX_VIDEO_NOC_ERR_ERRLOG0_LOW_OFFS	0x0520
+#define VCODEC_COREX_VIDEO_NOC_ERR_ERRLOG1_LOW_OFFS	0x0528
+#define VCODEC_COREX_VIDEO_NOC_ERR_ERRLOG2_LOW_OFFS	0x0530
+#define VCODEC_COREX_VIDEO_NOC_ERR_ERRLOG3_LOW_OFFS	0x0538
+
+/* ------------------------------------------------------------------ [7]
+ * The vendor PAS implementation is the plain three-call sequence, and it
+ * enables the regulator and clocks immediately before AUTH_AND_RESET.
+ * There is no share/unlock/XPU step anywhere in the video path.
+ */
+static int pil_mem_setup_trusted(struct pil_desc *pil, phys_addr_t addr,
+			       size_t size)
+{
+	...
+	desc.args[0] = d->pas_id;	/* = 9 for venus */
+	desc.args[1] = addr;
+	desc.args[2] = size;
+	desc.arginfo = SCM_ARGS(3);
+	ret = scm_call2(SCM_SIP_FNID(SCM_SVC_PIL, PAS_MEM_SETUP_CMD), &desc);
+	...
+}
+
+static int pil_auth_and_reset(struct pil_desc *pil)
+{
+	...
+	rc = enable_regulators(d, pil->dev, d->regs, d->reg_count, false);
+	...
+	rc = prepare_enable_clocks(pil->dev, d->clks, d->clk_count);
+	...
+	desc.args[0] = proc = d->pas_id;
+	desc.arginfo = SCM_ARGS(1);
+	rc = scm_call2(SCM_SIP_FNID(SCM_SVC_PIL, PAS_AUTH_AND_RESET_CMD), &desc);
+	...
+}

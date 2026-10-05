@@ -1709,6 +1709,801 @@ Sources: `MiCode/Xiaomi_Kernel_OpenSource` branch `nabu-r-oss`;
 (`arch/arm64/boot/dts/qcom/sm8150-vidc.dtsi`,
 `drivers/media/platform/msm/vidc/venus_boot.c`, `venus_hfi.c`).
 
+### Seventh round: CodeLinaro's `sdmshrike` tree *is* SC8180X
+
+Checked 2026-10-05.  `sdmshrike` is Qualcomm's internal name for **SC8180X**,
+this laptop's SoC, so this reference is the same part and not an analogue.
+Source: `git.codelinaro.org/clo/la/kernel/msm-4.14`, branch
+`auto-kernel.lnx.4.14.c34`, commit `9366ea378de5` (2025-04-10).  It is a 4.14
+`msm_vidc` tree, so nothing in it is portable code, but its device tree and
+register map are.  Extracts plus a fetch script live in `vendor-ref/`.
+
+#### The video subsystem is two devices, and one of them is TZ's
+
+`sdmshrike-vidc.dtsi` describes `qcom,vidc@aa00000` and nothing else, but
+`sdmshrike.dtsi` carries a second node that mainline has no equivalent for:
+
+```
+pil_venus: qcom,venus@aae0000 {
+	compatible = "qcom,pil-tz-generic";
+	reg = <0xaae0000 0x4000>;        /* the wrapper half: 0xE0000..0xE4000 */
+	vdd-supply = <&mvsc_gdsc>;
+	clocks = <&clock_videocc VIDEO_CC_XO_CLK>,
+		 <&clock_videocc VIDEO_CC_MVSC_CORE_CLK>,
+		 <&clock_videocc VIDEO_CC_IRIS_AHB_CLK>;
+	qcom,core-freq = <200000000>;
+	qcom,ahb-freq = <200000000>;
+	qcom,pas-id = <9>;
+	qcom,firmware-name = "venus";
+	memory-region = <&pil_video_mem>;
+};
+```
+
+All firmware handling belongs to that PAS node: it holds the MVSC GDSC, the
+`xo`/`core`/`ahb` clocks, PAS id 9, the firmware region, and the wrapper
+window.  The vidc node only ever drives the HFI.
+
+That this is the vendor's own design, not a mainline accommodation, is settled
+by `venus_hfi.c`/`venus_boot.c`: the kernel-side bring-up that programs
+`WRAPPER_SEC_CPA_START/END` (0x1020/0x1024), `WRAPPER_SEC_FW_START/END`
+(0x1028/0x102C) and clears `WRAPPER_A9SS_SW_RESET` (0x3000) runs only when the
+vidc node has **both** `qcom,use-non-secure-pil` and `qcom,fw-context-bank`,
+and `sdmshrike-vidc.dtsi` has neither.  On this board that path bails out at
+`fw_bias == 0` and those registers stay TZ's.  So the `use_tz` rule from round
+3 is the intended arrangement, and "stores to the wrapper stall the bus" is the
+hardware protecting TZ's block rather than a bug in the sequence.
+
+(One exception worth knowing: `WRAPPER_CPU_CGC_DIS` and
+`WRAPPER_CPU_CLOCK_CONFIG` at 0x2010/0x2000 are *not* in that protected set -
+the vendor driver writes both, to 0, from `clock_config_on_enable_vpu5` once
+the clocks are up.)
+
+#### What it confirms
+
+| Fact | Vendor `sdmshrike` | This tree |
+| --- | --- | --- |
+| register map | `vidc_hfi_io.h`: VBIF `0x80000`, CPU `0xC0000`, CPU_CS `CPU+0x12000`, WRAPPER `0xE0000` | the round-3 correction, now from a second independent source |
+| node window / IRQ | `0xaa00000`, 2 MB, `GIC_SPI 174` | `0xaa00000`, 1 MB (VIDEOCC is reserved), SPI 174 |
+| clocks | `gcc_video_axic/axi0/axi1` + `MVSC/MVS0/MVS1_CORE` | identical six, plus `ahb` |
+| resets | `GCC_VIDEO_AXIC_CLK_BCR`, `VIDEO_CC_MVSC_CORE_CLK_BCR`, `GCC_VIDEO_AXI0/AXI1_CLK_BCR` | identical four |
+| SMMU SIDs | `0x1300/0x60` ns, `0x1301/0x4`, `0x1303/0x20`, `0x1304/0x60` | non-secure `0x1300 0x60` in the node; the rest known from SM8150 |
+| VIDEOCC variant | `qcom,videocc-sm8150-v2` -> 240/338/365/444/**533** MHz | the OPP table added in round 1 is exactly that set |
+| PAS id | `qcom,pas-id = <9>` in the DT | `IRIS_PAS_ID` is 9 - the assumption was right |
+| firmware region | `pil_video_mem`, 5 MB, `no-map` | `video_mem`, 5 MB |
+| secure/non-secure VA split | pools `ns 0x25800000+`, `sec_non_pixel 0x1000000+0x24800000` | `tz_cp_config_sm8250` (`cp_size 0x25800000`, `nonpixel 0x1000000+0x24800000`) matches byte for byte |
+| HFI generation | `VPU_VERSION_5`, VPU4 vs VPU5 ops split | Gen1 HFI, `iris_vpu2_ops` |
+| SCM surface | `PAS_INIT_IMAGE`, `PAS_MEM_SETUP`, `PAS_AUTH_AND_RESET`; regulators and clocks enabled immediately before the auth | `qcom_mdt_load` + `pas_auth_and_reset`, same three calls |
+
+The SCM-surface row answers round 4/5's open question in the negative, and it
+agrees with round 6: **there is no share/unlock/XPU call anywhere in the video
+path**.  The vendor's own PAS implementation
+(`drivers/soc/qcom/subsys-pil-tz.c`) is the plain three-call sequence.  The
+"request to share / unlock subsystem memory" strings in `qcpil8180.sys` are a
+Windows hypervisor/TREE artefact, as suspected.
+
+#### What it changes
+
+1. **The wrapper interrupt bits are the V6 ones, and the boot-time mask is the
+   vpu4 one.**  This is one conflation in three places:
+   * `WRAPPER_INTR_MASK_A2HWD_BMSK` (and `WRAPPER_INTR_STATUS_A2HWD_BMSK`) are
+     `BIT(3)` in this tree - upstream `iris`'s *V6* watchdog bit.  Downstream
+     and upstream `venus` put the watchdog at `0x10`/`BIT(4)` and use
+     `0x8`/`BIT(3)` for **A2HVCODEC**, which is what the Venus-4xx map has and
+     V6 reuses for the watchdog.  So the IRQ handler's watchdog test is looking
+     at the VCODEC bit as well;
+   * consequently `iris_vpu_interrupt_init()`'s read-modify-write computes
+     `0x1f2` (it clears `0x8|0x4` from the `0x1f6` reset value) - which is
+     exactly the "Venus-6xx mask" the source comment rejects;
+   * `iris_vpu_boot_firmware()` then writes `0x8`, which is upstream `venus`'s
+     AR50 path (`IS_IRIS2() || IS_IRIS2_1()` else-branch) and downstream's
+     `interrupt_init_vpu4()` - the SDM845-class value, not this SoC's.
+
+   The vendor's **vpu5** path - and sdmshrike is `vpu_ver = VPU_VERSION_5` -
+   only clears CPU and watchdog from the `0x1f6` reset value, i.e. it leaves
+   **`0x1e2`**, and it does so once, never narrowing afterwards.  The current
+   value masks the VCODEC source the vendor unmasks and unmasks bits 1 and 5..8
+   that the vendor leaves masked.
+2. **The VPU is booted at the top OPP, the vendor boots it at 200 MHz.**
+   `iris_vpu_power_on()` calls `dev_pm_opp_set_rate(dev, ULONG_MAX)` when no
+   instance has asked for a rate yet, which selects 533 MHz.  The PAS node
+   asks for `qcom,core-freq = <200000000>` and `qcom,ahb-freq = <200000000>`,
+   i.e. the firmware handshake runs at the lowest rate in the table.  Worth
+   matching while the handshake is being debugged.
+3. **Three register blocks the tree does not have yet**, all inside the 1 MB
+   window, all useful for the "silent reset" that round 5 ends on:
+   * `VCODEC_CORE0_VIDEO_NOC_BASE_OFFS = 0x4000` and
+     `CVP_NOC_BASE_OFFS = 0xC000`, with `ERRVLD` at `+0x510` and `ERRCLR` at
+     `+0x518` - a NoC error from the VPU is exactly the event round 5
+     diagnosed, and this is the register pair that would confirm it (clear
+     before a retry, read after);
+   * the VBIF AXI-halt handshake, `VBIF 0x80000`: `VENUS_VBIF_AXI_HALT_CTRL0`
+     `0x80208` / `_CTRL1` `0x8020C`, `HALT_REQ`/`HALT_ACK`, 500 ms timeout,
+     plus `VIDC_VENUS_VBIF_CLK_ON` at `0x80004`;
+   * `WRAPPER_HW_VERSION` at wrapper `+0x00`, decoded as major `31:28`,
+     minor `23:16`, step `15:0`.  Reading `0xaae0000` would settle round 2's
+     naming caveat (`VIDEO.IR.1.2` versus the binding's "Iris v2.xx") from the
+     hardware instead of by inference - the low wrapper window reads safely,
+     as `WRAPPER_INTR_MASK` already proved.
+4. **The firmware region address is a difference to record, not to fix.**  The
+   vendor pins video at `0x96e00000` (5 MB, directly above the 150 MB modem
+   region).  This tree instead uses `0x8bd80000`, the base of the Windows
+   "PGCM" pool, and TZ accepts it (`PAS_MEM_SETUP` and `PAS_AUTH_AND_RESET`
+   both return 0 there), so there is no reason to move it.
+
+#### What it does not give
+
+Nothing here explains the silent reset at the end of round 5, and nothing here
+is a Linux-side substitute for the secure-world steps - the vendor reaches TZ
+through the same three SCM calls mainline does.  The remaining candidates are
+unchanged: a NoC/XPU-class event below Linux, or a firmware/core mismatch that
+the interrupt mask and boot rate above might themselves be provoking.
+
+#### Ordered next attempt
+
+1. `iris_vpu_common.c`: move the two `A2HWD` bits from `BIT(3)` to `BIT(4)`,
+   drop the `writel(0x8, WRAPPER_INTR_MASK)` in `boot_firmware()` and let the
+   read-modify-write in `iris_vpu_interrupt_init()` stand (it then yields
+   `0x1e2`);
+2. `iris_vpu_power_on()`: use the table minimum (or an explicit 200 MHz)
+   instead of `ULONG_MAX` for the power-on rate, and set the `ahb` clock to the
+   same rate before enabling it;
+3. before enabling `&venus`, add a one-shot read of `0xaa04510` (NoC `ERRVLD`)
+   and `0xaae0000` (`WRAPPER_HW_VERSION`) to the existing trace breadcrumbs, so
+   the first attempt after these changes reports both;
+4. only then rebuild the probe DTB and take a boot, with the round-5 capture
+   recipe armed (`panic_on_rcu_stall=1`, `kernel.panic=20`, ramoops).
+
+#### Applied 2026-10-05
+
+Points 1-3 are in the kernel tree (`src/kernel`, branch
+`xiaomi-mainline-panel2`, not yet committed):
+
+* `iris_vpu_common.c`: `WRAPPER_INTR_STATUS_A2HWD_BMSK` and
+  `WRAPPER_INTR_MASK_A2HWD_BMSK` are `BIT(4)` now, and
+  `iris_vpu_boot_firmware()` no longer writes `0x8` over the mask - the
+  read-modify-write in `iris_vpu_interrupt_init()` stands.  The value to look
+  for in the trace is **`intr_mask=0x1e2`**.
+* `iris_vpu_common.c`: `iris_vpu_power_on()` uses `IRIS_BOOT_FREQ`
+  (200 MHz, the vendor's `qcom,core-freq`) instead of `ULONG_MAX` when no
+  instance has voted yet.  Measured on hardware this gives
+  **`IRIS_HW_CLK = 200000097 Hz`**, not the 240 MHz that was predicted here at
+  first: `_opp_config_clk_single()` programs the *rounded* target frequency for
+  the rate and uses the next OPP up (240 MHz, the table's lowest) only for its
+  `required-opps` voltage corner.
+  The separate `clk_set_rate()` on the `ahb` clock that point 2 asked for was
+  dropped: MVSC, MVS0 and AHB are three branches off the *same*
+  `video_cc_iris_clk_src`, so the one OPP `set_rate` already moves all three and
+  a second one would only add a transient flip-flop.
+* `iris_vpu_common.c` + `iris_vpu_register_defines.h`:
+  `iris_vpu_trace_probe_registers()` reads `WRAPPER_HW_VERSION` (wrapper + 0x00)
+  and the VCODEC core0 NoC `ERRVLD` (vidc + 0x4510) at the top of
+  `iris_vpu_boot_firmware()`, and the two `ERRLOG0` words only if `ERRVLD` is
+  set - one new register access in the expected case, on a block this board has
+  not been talked to before.  It prints
+  `IRIS-TRACE: probe: hw_version=... (major N minor N step ...) intr_mask=...
+  noc_errvld=...`.
+* to read the rate back, `iris_get_clk_by_type()` had to stop being static
+  (`iris_resources.c`, `iris_resources.h`), plus `#include <linux/clk.h>` in
+  `iris_vpu_common.c`.
+
+The first boot after this has to answer three things, all of them in the trace
+before the point where the machine used to reset:
+
+1. `intr_mask=0x1e2` (the vendor's vpu5 value) rather than `0x1f2`/`0x8`;
+2. `IRIS_HW_CLK = 200000097` (~200 MHz) rather than 533000000;
+3. `hw_version=` - whether the core really is the "Iris v2.xx" of the sm8250
+   binding or an older revision, which is what round 2 left unresolved; and
+   `noc_errvld=0`, or a non-zero value with an `errlog0` to decode.
+
+Built and packaged as `linux-mibook-6.18.2-1-11-aarch64.pkg.tar.zst`
+(2557 modules, 0 missing, no compile errors).  Checked inside the package
+before handing it over: the iris module carries the new trace strings and no
+longer contains the `intr mask 0x8` write, the plain and `-oc` DTBs have the
+video node `disabled`, and `-vdec-probe.dtb` has it `okay` together with
+`firmware-name = "qcom/sc8180x/venus.mbn"`.
+
+##### The `no_auth=1` run (pre-auth half, 2026-10-05)
+
+`sudo modprobe qcom-iris no_auth=1` on the `-11` build, with the probe DTB
+active.  It answered two of the three questions and, more usefully, drew a
+clean line around what is *not* dangerous:
+
+    enable clock 2 (video_cc_iris_ahb_clk)      ret=0   <- round 4's blocker
+    enable clock 1 (gcc_video_axic_clk)         ret=0
+    enable clock 0/5/3/4  (axi0, axi1, mvsc, mvs0)      <- all six clocks up
+    opp set_rate(200000000)
+    opp done, IRIS_HW_CLK = 200000097 Hz
+    WRAPPER_INTR_MASK (+0xe0010) = 0x1f6 (expect 0x1f6)
+    set remote state ret=-22
+    fw region phys=0x8bd80000 size=5242880
+    qcom_mdt_load ret=0
+
+So: the whole pre-auth path - power domains, all six clocks including the AHB
+one, the OPP at ~200 MHz, the wrapper register read, the SCM remote-state
+call, `qcom_mdt_load` and the image authentication - runs without a bus stall
+and the failure path is survivable.  It ran **three times in one modprobe**
+(15 s apart, the debug window below); that repetition is
+`iris_sys_error_handler()` in `iris_probe.c` re-running `iris_core_deinit()` +
+`iris_core_init()`, not the operator.
+
+Two things it could **not** answer, by construction:
+
+* `iris_firmware.c:161-168` returns `-EIO` from `iris_fw_load()` in the
+  `no_auth` branch (after a `msleep(15000)` "window" meant for
+  `videocc-peek.py`), so `iris_vpu_boot_firmware()` never runs - and that is
+  where the `probe:` line lives.  `hw_version` and `noc_errvld` therefore need
+  the real run;
+* because `core_init` jumped to `error_power_off` and not `error_unload_fw`,
+  `iris_fw_unload()` (and with it `qcom_scm_pas_shutdown`) never ran: the PAS
+  is left with the image authenticated and the core still held.  Reboot before
+  the real probe rather than stacking a fourth `init_image` onto that state.
+
+##### The real run (2026-10-05): CTRL_INIT is acknowledged, and the wall moves
+
+`sudo modprobe qcom-iris` on the `-11` build with the probe DTB active.  This is
+the first attempt that got past the point where round 5 lost the machine:
+
+    PAS auth and reset (SCM call)
+    PAS auth ret=0                       <- TZ released the core
+    mem protect video var (SCM call)
+    core_init: boot firmware
+    boot_fw: probe registers
+    probe: hw_version=0x5010002f (major 5 minor 16 step 0x2f) intr_mask=0x1e2 noc_errvld=0x0
+    boot_fw: ucregion map
+    boot_fw: CTRL_INIT write
+    boot_fw: ctrl_status=0x1 count=77    <- the firmware answered
+    core_init: hfi core init
+    core_init: waiting for sys response
+    <machine dies>
+
+Three answers, all of them the ones the fixes were aimed at:
+
+* **`intr_mask=0x1e2`** - the vendor's vpu5 value, on hardware, at last.  The
+  `BIT(4)` A2HWD correction and dropping the `writel(0x8)` did what they were
+  supposed to;
+* **`IRIS_HW_CLK = 200000097 Hz`** - the bottom of the table instead of 533 MHz;
+* **`hw_version=0x5010002f`** - decoded with the vendor/mainline masks that is
+  major `5`, minor `0x10`, step `0x2f`.  It does not by itself settle round 2's
+  "Iris v2.xx" naming caveat (there is no SM8250 value to compare against), but
+  it is now on record as the number this part reports.
+
+And `noc_errvld=0x0` at that point: no NoC error had been logged yet.
+
+**The wall moved from "the first register write after power-on" to "the
+firmware is running and has been sent SYS_INIT".**  `iris_vpu_boot_firmware()`
+returned success (`ctrl_status=0x1`, count 77 of 1000, no error bits), the HFI
+queues were programmed, `iris_hfi_core_init()` queued SYS_INIT and got as far as
+`iris_wait_for_system_response()` - and the machine died inside that window.
+How it died is still unknown, and that is the gap to close.
+
+**The capture gap.**  journald has *none* of this run: of the last four boots
+only the `no_auth` one contains `IRIS-TRACE` lines at all, and the boot that
+died is the only one that ended without a `systemd-shutdown` line.  The trace
+survives only because the operator ran `dmesg -w` into a file, and that file may
+itself be missing its tail (the register-dump line came out, the death did not).
+So "hard stall (screen frozen, power-cycle needed)" and "reset from below Linux"
+are still not distinguished - and if it was a reset, any `arm-smmu` "Unhandled
+context fault" line went with it.  Round 5 taught the same lesson; what changed
+is that the interesting lines now print *before* the fatal point.
+
+**Two divergences from the vendor's own sdmshrike driver** came out of
+comparing the boot path, and both are worth eliminating on their own merits:
+
+| | vendor `sdmshrike` (`msm-4.14`) | this tree (`-11`) |
+| --- | --- | --- |
+| UC region | `SHARED_QSIZE = ALIGN(SFR + QUEUE + QDSS, SZ_1M)`, and the queue block is sized to fill it up to the SFR/QDSS blocks, so the whole advertised region is mapped | `UC_REGION_SIZE = ALIGN(SFR_SIZE + queue_size, SZ_1M)` while only `queue_size` was allocated there - ~0.5 MB of the advertised region was unmapped IOVA, and the SFR sat in a separate allocation |
+| `VIDC_VERSION_INFO` | never written (mainline `venus` writes 1 only for `IS_V1()`) | `writel(0x1, CPU_CS_SCIACMDARG3)` before `CTRL_INIT`, i.e. HFI 1.x advertised to a firmware fed HFI-4xx packets |
+
+`-12` fixes both (one 1 MB-aligned allocation, SFR at the end of it; the
+version-register write dropped) and replaces the sleeping wait with a polling
+one that prints every change of `WRAPPER_INTR_STATUS`, `CTRL_STATUS`, the NoC
+`ERRVLD` bit and the message queue's write index, plus the total on response or
+timeout.  The UC region line (`IRIS-TRACE: ucregion: qtable=... size=... sfr=...`)
+also goes into the log, so the next run shows exactly what the firmware was
+told.
+
+What the next run has to answer, in order:
+
+1. does the firmware write anything into the message queue (`msgq_write_idx`)
+   before the machine goes - and does `noc_errvld` ever set?
+2. if it gets as far as a response, does `/dev/video0` appear;
+3. if it dies the same way, whether it was a stall (a rebuild with
+   `panic_on_rcu_stall` / `hung_task_panic` armed would leave a ramoops record)
+   or a reset below Linux (which would not).
+
+###### The run that was not the new build (and the tooling bug behind it)
+
+The second probe run on 2026-10-05 reproduced the first one exactly -
+`ctrl_status=0x1`, `count=75` instead of 77, and the same death right after
+`waiting for sys response` - *including* the absence of every new `-12` line
+(`IRIS-TRACE: ucregion: ...`, `IRIS-TRACE: wait t=...`).  It was running the
+`-11` module: the `sha256` of the installed
+`/usr/lib/modules/6.18.2-1-mibook+/.../qcom-iris.ko` equals the copy inside
+`linux-mibook-6.18.2-1-11-aarch64.pkg.tar.zst`, and `pacman.log`'s last
+linux-mibook transaction is the `-11` install at 15:35:55.
+
+The cause was in `tools/probe-vdec-run.sh`, not in the hardware.  Its "already
+this build" gate compared `/boot/vmlinuz-linux-mibook` against the tree's
+`Image` and checked that the installed module files are root-owned - and a
+**module-only rebuild leaves the kernel image byte-identical**, so the gate said
+"already this build ... skipping the package install" and `pacman -U` never ran.
+The script then re-copied the probe DTB and its own verification passed (it too
+only looked at the kernel, the DTBs, the blacklist and file ownership), so it
+reported success.  A change to `iris_hfi_queue.c`/`iris_vpu_common.c` is exactly
+that case.
+
+Both places now compare the installed module **byte for byte with the copy
+inside the package** (`bsdtar -xOf "$PKG" <member> | sha256sum`), which is the
+practical form of round 5's "check the build timestamp *and* a unique string
+from the new build".  mtimes are unusable here because the packaged copy is
+stripped, the bytes are not.
+
+Useful by-product: the `-11` failure is *reproducible* - same `ctrl_status`, same
+point, twice - so it is a stable fault, not a race.
+
+###### The `-12` run: the hang is on the first firmware interrupt
+
+`-12` really ran this time (the `ucregion:` and `wait` lines are there).  The
+tail of the trace:
+
+    probe: hw_version=0x5010002f (major 5 minor 16 step 0x2f) intr_mask=0x1e2 noc_errvld=0x0
+    boot_fw: ucregion map
+    ucregion: qtable=0xdfc00000 size=0x400000 sfr=0xdffff000
+    boot_fw: CTRL_INIT write
+    boot_fw: ctrl_status=0x1 count=79
+    core_init: hfi core init
+    core_init: waiting for sys response
+    wait t=0ms intr_status=0x6 ctrl_status=0x1 noc_errvld=0x0 msgq_write_idx=0
+    <hang, then the hardware watchdog resets the board>
+
+That `ucregion:` line is what `-12` was for: one allocation at
+`0xdfc00000`, 4 MB, SFR at its end (`0xdffff000` = base + size - 4K), and the
+address is inside the iris device's DMA domain (the region ends exactly at the
+`0xe0000000` DMA mask), so the SMMU is attached and translating.  CTRL_INIT was
+acknowledged again.
+
+**The step forward is `intr_status=0x6` and what follows it.**  0x6 is A2H
+(`BIT(2)`, the firmware saying it has something for the host) plus `BIT(1)`, a
+source the vendor leaves masked.  The firmware therefore *did* raise the
+interrupt this time - and `msgq_write_idx=0` says it had not yet put anything in
+the message queue when the wait began.
+
+Then: nothing.  No further poll print, no `wait: no response in 1000 ms`, no
+`core init failed`.  The machine hung and the **hardware watchdog**
+(`qcom,wdt`, bark-time 11 s) reset it - it was *not* a software panic: ramoops
+reports all four record slots as `uncorrectable error in header`, i.e. empty, on
+the next boot.  So the death is now localised to **the driver's first pass
+through the firmware-interrupt path**.
+
+Two ends are possible, and both are new code that has never completed before:
+
+* `iris_vpu_clear_interrupt()` writes `CPU_CS_A2HSOFTINTCLR` and
+  `WRAPPER_INTR_CLEAR`.  Neither register has ever been written by this driver
+  (every previous run died earlier), and the wrapper's *upper* window was
+  already shown to stall the bus when touched (round 4);
+* an interrupt storm.  The A2H line is level-based on the message queue having
+  data, so if `hfi_response_handler()` never drains the queue - wrong HFI
+  version, a packet it does not understand, or an `iris_hfi_queue_read()` that
+  consumes nothing - the handler re-enters forever and the board hangs exactly
+  like this.  It is also what the two references do *not* have in common with
+  this driver: mainline venus and the vendor both clear and drain in one pass,
+  and both run their message pump to completion.
+
+`-13` instruments precisely that path: capped breadcrumbs
+(`intr_status`, `intr_mask`, `ctrl_status`, `noc_errvld`, message queue read and
+write index) at handler entry, after the clear and after the response handler,
+plus a **storm guard** that stops re-enabling the IRQ once 100 interrupts have
+arrived with less than 50 ms between them.  If it is a storm the machine should
+now survive it, the 1 s wait should time out, and the log should show the burst
+and the queue indices that explain why nothing was drained.
+
+###### The actual bug: the H2X doorbell went to the Venus-6xx address
+
+The `-13` run came back with the answer, and it is not a storm.  The whole
+interrupt path completed, once, cleanly:
+
+    isr[0 entry]:   intr_status=0x6 intr_mask=0x1e2 ctrl_status=0x1 noc_errvld=0x0 msgq_r=0 msgq_w=0
+    wait t=0ms intr_status=0x6 ...
+    wait t=0ms intr_status=0x2 ...          <- A2H cleared by the driver
+    isr[1 cleared]: intr_status=0x2 ...     <- so the clear works
+    isr[2 done]:    intr_status=0x2 ...     <- response handler returned
+    <hang, hardware watchdog reset>
+
+One interrupt, handled end to end, with the message queue untouched
+(`msgq_w=0`).  So neither the clear path nor the response handler is the
+problem, and the firmware never wrote a byte to the host.
+
+That pointed at the *other* direction - the host-to-firmware doorbell - and
+there the register map is wrong:
+
+| | mainline `venus` | vendor `sdmshrike` | this tree |
+| --- | --- | --- | --- |
+| CPU interrupt controller | `CPU_IC_BASE = CPU_BASE + 0x1f000` | `VIDC_CPU_IC_BASE_OFFS = CPU_BASE + 0x1F000` | `CPU_IC_BASE_OFFS = CPU_BASE` (!) |
+| doorbell register | `CPU_IC_SOFTINT = 0x18` | `VIDC_CPU_IC_SOFTINT = +0x18` | `+ 0x150` (!) |
+| H2X bit | `CPU_IC_SOFTINT_H2A_SHIFT = 0xf` -> `BIT(15)` | `VIDC_CPU_IC_SOFTINT_H2A_SHFT = 0xF` -> `1 << 15` | shift `0x0` -> `1` (!) |
+
+`venus_soft_int()` picks the `_V6` values only `if (IS_V6() || (IS_V4() &&
+is_lite()))`; this SoC is neither, so it takes `BIT(0xf)` at `CPU_IC + 0x18`.
+The vendor's `__iface_cmdq_write()` does exactly the same.  All three of the
+columns on the right are the *V6* values, which is what upstream `iris` uses for
+SM8550/SM8650 - and the round-3 register-map correction repointed `CPU_BASE`,
+`CPU_CS_BASE` and `WRAPPER_BASE` for the 4xx map but not these, because they
+were written as `CPU_BASE_OFFS` plus a *delta* and so silently followed
+`CPU_BASE` to `0xC0000` while keeping the V6 offsets.
+
+`iris_vpu_raise_interrupt()` was therefore writing **`1` to `0xC0150`** where it
+had to write **`0x8000` to `0xDF018`**.  Every HFI command this driver ever
+queued was written into the command queue and then never announced: the
+firmware had no reason to look at the queue, which is exactly what the traces
+show (`msgq_write_idx = 0` in every run, no SYS_INIT response ever), and why the
+1 s wait could never succeed.  The stray write into the middle of the CPU block
+is also the best candidate for the hang that follows it - that address is not a
+register this driver has any business writing.
+
+`-14` fixes the three values and extends the traces to print all three queues'
+read/write indices, so the next run can be read directly: `cmdq_r` should reach
+**3** as the firmware consumes `sys_init`, `image_version` and
+`interframe_powercollapse`, `msgq_w` should become non-zero when the SYS_INIT
+done response lands, and the wait should then report
+`wait: response after N ms` instead of hanging.
+
+This is a genuine bug in the `iris` driver for any Venus-4xx core, not a
+board-specific hack - worth keeping for an eventual upstream submission.
+
+###### The `-14` run: the failure point moves with the core, not with our registers
+
+With the doorbell fixed, `-14` got *less* far than `-13`: its log ends on
+`boot_fw: CTRL_INIT write` with no `ctrl_status=...` line after it at all, where
+`-13` had printed `ctrl_status=0x1 count=77` 8 ms later.
+
+That is the point.  Lining the runs up:
+
+| run | last thing the driver managed | ~time after `PAS auth ret=0` |
+| --- | --- | --- |
+| `-11` (twice) | `waiting for sys response` | ~9 ms |
+| `-12` | first `wait` poll (`intr_status=0x6`) | ~9 ms |
+| `-13` | a complete interrupt round trip (`entry`/`cleared`/`done`) | ~9 ms |
+| `-14` | the `CTRL_INIT` write itself | ~0.02 ms |
+
+Nothing in common in the *driver's* actions - the common factor is that TZ has
+just released the core and the machine wedges within a few milliseconds.  And
+the `no_auth=1` run is the control: with the core **not** released the driver
+took the whole pre-auth path three times in a row and the machine was fine.
+
+So the working hypothesis is now that **what takes the bus down is the firmware
+starting to execute** - its first memory accesses (through the SMMU, and with
+the four secure context banks that only TZ knows about) - and not any particular
+register this driver touches.  If that is right, no amount of driver-side
+register fixing will get past it.
+
+`-15` bisects exactly that with a new `hold_after_auth_ms` parameter: after
+`qcom_scm_pas_auth_and_reset()` returns, the driver touches no VPU register for
+half the interval, then takes one snapshot, then waits out the other half.
+
+* nothing after `hold: N ms with no VPU register access at all` -> the core's
+  own execution wedges the bus; look at the firmware image, the SMMU streams
+  and the secure context banks, not the driver;
+* `hold 1/2 survived` and then nothing -> the first register access after the
+  release is what trips it;
+* both holds and then the usual death -> it is later than the release, i.e. the
+  `CTRL_INIT` path again.
+
+Caveat on `-14`: if that capture was a plain `dmesg -w > file` rather than
+`stdbuf -oL ... | tee`, its last few KB may simply be missing and "before the
+acknowledgement" is provisional.  The next run should use the unbuffered form.
+
+###### The `-15` bisect: the released core is harmless until CTRL_INIT
+
+    PAS auth ret=0
+    hold: 6000 ms with no VPU register access at all
+    hold 1/2 survived, first register snapshot now          (+3025 ms)
+    isr[0 hold-read]: intr_status=0x0 intr_mask=0x1e2 ctrl_status=0x0
+                      noc_errvld=0x0 cmdq_rw=0/0 msgq_rw=0/0 dbgq_rw=0/0
+    hold 2/2 survived, continuing                           (+3009 ms)
+    mem protect video var (SCM call)
+    ... CTRL_INIT -> ctrl_status=0x1 count=66 -> wait -> intr_status=0x6 -> death
+
+So the `-14` reading was wrong: **the released core sat there for six seconds
+with no VPU register access at all and the machine was completely fine** - the
+snapshot even read back cleanly (`intr_status=0x0`, `ctrl_status=0x0`, every
+queue empty).  The firmware is not doing anything harmful by itself; before
+CTRL_INIT it is idle and waiting for the host.
+
+What the failure needs is CTRL_INIT.  The acknowledgement comes back
+(`ctrl_status=0x1 count=66`), A2H goes up (`intr_status=0x6`, i.e. the firmware
+signalling plus the masked `BIT(1)`), every queue is still `0/0`, and the
+machine goes - and this time not even the `isr[... entry]` breadcrumb printed,
+where `-13` had run a whole interrupt round trip.  The death races the first
+thing the firmware does after being kicked.
+
+A2H raised with **all three queues untouched** is the one clue left on the
+table, and it is precisely what the SFR exists for: the subsystem failure
+reason buffer is where this firmware writes why it gave up.  The driver has
+never read it - `-16` does (size, bytes written, and the first 96 bytes as
+text) after CTRL_INIT is acknowledged, on every change in the wait loop and in
+the interrupt snapshot.  Because the SFR is plain DDR at the end of the UC
+region, reading it costs *no* VPU register access, so it is safe in exactly the
+state the machine dies in.
+
+`-16` also adds `hold_after_ctrl_init_ms`, which waits between CTRL_INIT being
+acknowledged and the first HFI command - to separate "CTRL_INIT, i.e. the
+firmware's own post-init work, is enough to kill it" from "our H2X doorbell is
+what it reacts to".
+
+###### The `-16` run: the window is ~10 ms after the CTRL_INIT write
+
+`-16` (with `hold_after_ctrl_init_ms=6000`, i.e. no `hold_after_auth_ms`) ended
+on `boot_fw: CTRL_INIT write` again - no `ctrl_status` line, and of course no
+`sfr[post-ctrl-init]`, which sits after the poll loop.  Same shape as `-14`.
+
+Lining the six runs up once more, the acknowledgement itself takes 8-10 ms
+(`count=77`/`79`/`66` polls at ~110 us), and the death lands somewhere inside
+that window:
+
+| | CTRL_INIT write | ack printed | then |
+| --- | --- | --- | --- |
+| `-11`, `-12` | yes | yes | dead at `waiting for sys response` |
+| `-13` | yes | yes | one full interrupt round trip, then dead |
+| `-15` | yes | yes | A2H, then dead |
+| `-14`, `-16` | yes | **no** | dead inside the poll |
+
+Two conclusions follow, and they change what the next experiment has to be:
+
+1. writing CTRL_INIT starts something in the firmware that takes the VPU's bus
+   away about 10 ms later - it is not our command queue, not the doorbell
+   (`-14`/`-16` never got that far) and not the interrupt path;
+2. in `-14`/`-16` the log stops with no output for the whole remaining window,
+   which is exactly the shape of **a CPU stuck inside `readl(CTRL_STATUS)`** -
+   and a CPU stuck in an MMIO read is also what turns "the VPU is gone" into "the
+   machine is frozen, then the hardware watchdog resets it".  Our own polling is
+   therefore part of the blast radius, independently of why the bus goes.
+
+`-17` acts on that with `quiet_after_ctrl_init_ms`: after the CTRL_INIT write it
+reads **no VPU register at all**, sleeps, reads only the SFR (plain DDR, still
+reachable with the VPU bus gone) and fails the probe cleanly.  Three outcomes,
+all of them informative:
+
+* machine survives, `sfr[quiet]: written=0` -> the firmware has nothing to
+  report, and since nothing of ours touched the bus, the wedge was not caused by
+  a register access we made;
+* machine survives, `sfr[quiet] text='...'` -> **the firmware's own reason for
+  stopping**, printed even though its bus is dead.  That is the answer this whole
+  sequence has been looking for;
+* the machine still dies during the quiet sleep -> the firmware wedges the bus by
+  itself, with no host register access involved at all.
+
+###### The `-17` run: it is the third case
+
+    boot_fw: CTRL_INIT write
+    quiet: 6000 ms after the CTRL_INIT write, no register access
+    <dead>
+
+No `sfr[quiet]`, no `quiet: done`: the machine went down inside the 6 s sleep,
+with the driver touching **no VPU register at all** after the CTRL_INIT write,
+and before even the DDR-only SFR read.
+
+Put together with `-15` (six seconds completely stable with the core released
+and no CTRL_INIT), the picture is now unambiguous:
+
+* the released core is harmless while it waits for CTRL_INIT;
+* CTRL_INIT starts something in the firmware, and about 10 ms later the VPU's
+  bus is gone;
+* nothing the host does after that write is involved - not the `CTRL_STATUS`
+  poll (the `-16` hypothesis, dead), not the H2X doorbell, not the interrupt
+  path.
+
+So the remaining question is not "what does the driver do wrong" but "what does
+the firmware need that is not there".  Two candidates, and the firmware image is
+*not* one of them:
+
+**The image is fine.**  `qcom_scm_pas_init_image` authenticates it, TZ releases
+the core with it, and the core executes it far enough to answer the CTRL_INIT
+handshake - a wrong or reshaped image cannot do that (round 3 showed TZ
+authenticates the ELF header and program-header table too).  The copy installed
+(`md5 d99528d5010d9e8ed71c4276ddc0bb1c`, `VIDEO.IR.1.2-00079-PROD-2`) is
+byte-identical to the one Windows itself loads
+(`/Windows/System32/qcvss8180.mbn` and the 2025 DriverStore package), so
+re-extracting it from the Windows partition would produce the same bytes.  The
+only other build on that machine is the 2022 driver's
+`6909a826800cf68d4bc82e05c10bc132` (`VIDEO.IR.1.2-00042-PROD-1`), an older build
+of the same IR.1.2 generation - worth remembering as an A/B, not worth trying
+first.
+
+**The environment is the suspect**, and the one unresolved item there is round
+4's blocker #2: `VIDEO_CC_IRIS_AHB_CLK` (VIDEOCC `0x8f4`) "cannot be enabled",
+while the vendor's own `pil_venus` node lists exactly that clock as required
+(`clocks = <xo>, <mvsc_core>, <iris_ahb>`) - it is the VPU's register/AHB
+interface clock.  Right next to it is `VIDEO_CC_INTERFACE_BCR` (`0x8f0`), the
+**AHB2AXI bridge reset**, which mainline's `videocc-sm8150` does not expose as a
+reset at all: its binding has exactly one (`VIDEO_CC_MVSC_CORE_CLK_BCR`).  A
+bridge held in reset is precisely the kind of thing that makes traffic through
+it stop answering - which is the shape of every failure in this section.
+
+`debug/videocc-peek.py dump` answers both with no rebuild and without going near
+the VPU (VIDEOCC/GCC only), and the `no_auth=1` window is the state in which the
+machine is provably stable, so it can be run safely:
+
+    sudo modprobe qcom-iris no_auth=1 &
+    sleep 1
+    sudo python3 debug/videocc-peek.py dump | tee ~/videocc.txt
+
+What it should say: `videocc +0x08f4 ... branch_enable(bit0)=1 clk_off(bit1)=0`;
+`videocc +0x08f0 ... reset deasserted (bit0=0)`;
+`videocc +0x0814`/`+0x0874 ... PWR_ON(bit31)=1 (POWERED)`; and the RCG/branches
+at `0x7f0`, `0x850`, `0x890` enabled.
+
+###### First look at VIDEOCC (idle state, 2026-10-05)
+
+The first `dump` came ~17 s after the last `no_auth` window's teardown (this
+boot ran three of them, `core_init: vpu power_on` at 251/266/282 s, each 15.5 s
+apart), so it shows the *idle* state - which is exactly why `0x8f4` reads 0:
+the driver clears that branch when it powers the VPU down.  It does settle
+things, though:
+
+* `0x8f0 VIDEO_CC_INTERFACE_BCR` = 0 -> the AHB2AXI bridge is **not** held in
+  reset.  That suspected cause is out;
+* `VCODEC0_GDSC` (0x874) = `0x00282002`: SW_COLLAPSE=0 (armed) with PWR_ON=0
+  (not powered), and `mvs0_core_clk` (0x890) enabled but `CLK_OFF` (bit 31).
+  This is **expected**, not a fault: mainline defines `vcodec0_gdsc` with
+  `HW_CTRL_TRIGGER`, so Linux only *arms* it and the **hardware** - the VPU's
+  own power sequencer, driven by the firmware - powers it up on demand.
+  `PWR_ON=0` before the firmware asks for it means nothing; it is that request,
+  made right after CTRL_INIT, that pulls the domain up - and it goes through the
+  VPU's register/AHB interface;
+* `VENUS_GDSC` PWR_ON=1 and `mvsc_core_clk` still enabled after the teardown:
+  the MVSC domain is left powered.  Worth cleaning up, not obviously harmful.
+
+The reading that matters - `0x8f4` **while the driver has the VPU powered** - can
+only come from a dump taken inside the `no_auth` window.
+
+###### The live in-window dump: everything up except the AHB branch
+
+Taken inside a real `no_auth` window (the log confirms `WINDOW OPEN 15 s`
+immediately before it).  Everything the driver asks for is up:
+
+| register | value | meaning |
+| --- | --- | --- |
+| `0x0814` VENUS_GDSC | `0xf8282000` | powered |
+| `0x07f4` CFG_RCGR | `0x00000103` | the iris RCG is configured and running |
+| `0x0850` mvsc_core | `0x00000221` | bit 0 = 1, bit 31 = 0: enabled and running |
+| `0x0890` mvs0_core | `0x80000221` | enabled; output halted because vcodec0 is not powered yet (expected - `HW_CTRL_TRIGGER`) |
+| `0xb024` gcc axi0 | `0x00004221` | enabled and running |
+| `0x08f0` INTERFACE_BCR | `0x00000000` | bridge not held in reset |
+| **`0x08f4` iris_ahb_clk** | **`0x00000000`** | **bit 0 = 0: not enabled** |
+
+The dump carries its own control: `0x850 mvsc_core` lives in the *same* BRIC
+page, is declared the *same* way (`BRANCH_VOTED`, `enable_mask = BIT(0)`,
+`clk_branch2_ops`) and was enabled by the *same* driver run - and its bit 0 *is*
+set.  So bit 0 can stick for a voted branch in this block, and the AHB branch is
+the one that refuses.  A raw write of bit 0 from `videocc-peek.py` does not
+change it either.
+
+That matters because `0x8f4` is the AHB2AXI bridge clock - the VPU's *outbound*
+path for its own masters (its route to the SMMU and DDR).  With that bridge
+unclocked the firmware can still run its CPU (which is why it answers CTRL_INIT)
+but its first outbound access can never complete, which is exactly the "the
+machine dies ~10 ms after CTRL_INIT with no host register access" that `-17`
+proved - and it is also the first explanation that fits the two things that have
+been odd all along: **`msgq_write_idx` never moved and the SFR was never
+written**, i.e. the firmware cannot reach DDR at all.
+
+The `ahb-probe` run settled the first half and then undid the conclusion.  Its
+control was written badly the first time (it wrote back the value already in
+VENUS_GDSC, where bit 0 was already 0, so "write landed" proved nothing); fixed
+to toggle `VCODEC1_GDSC` bit 0 for real, the control did land - `0x8b4` went
+`0x00282001 -> 0xf8282000`, i.e. the write not only stuck but **powered the
+vcodec1 domain up** - and `0x8f4` still refused every value it was given,
+including the reserved bit 16.  Same 4 KB page, same mapping, same run, one
+register accepts writes and the other does not.
+
+**But that does not mean the AHB clock is off.**  This boot has no
+`status stuck at 'off'` warning anywhere (the only clock WARN is `sdhci_msm_probe`
+on the SD controller's RCG), and mainline's `clk_branch_wait()` raises exactly
+that WARN and returns `-EBUSY` whenever `CBCR_CLK_OFF` (bit 31) is set.  So when
+the driver enabled `video_cc_iris_ahb_clk` and got 0 back, bit 31 was clear -
+and "bit 31 clear" is the driver's own definition of *the branch is running*.
+The live dump agrees: `0x8f4 = 0x00000000`.
+
+Retraction, then: reading "bit 0 = 0" as "the bridge has no clock" was an
+over-reading.  The consistent picture is a hardware-gated/voted branch whose
+software enable bit is inert - the driver's halt check looks at bit 31, the
+hardware says it is not off, and the driver is satisfied - so **the AHB branch is
+a red herring**, not the cause of the failure.
+
+###### The ACPI `PAGETABLES` manifest: the video banks are split by address
+
+`~/acpi-dumps/dsdt.dsl`'s `GPU0` "PAGETABLES" package (13 entries) gives each of
+the video's SMMU banks an **IOVA window**.  The field order is pinned down by the
+graphics and crypto entries in the same package (`GraphicsGlobalPT` is a 64-bit
+512 GB range, `GraphicsPerProcessPT` starts at 4 MB, and each non-secure window
+ends where its secure one begins); field 3 is the secure flag and the video
+entries' last field is the bank index:
+
+| entry | secure | IOVA window |
+| --- | --- | --- |
+| `VideoNonSecurePT` | no | `0x00100000` + `0xBFF00000` -> `0x00100000..0xBFFFFFFF` |
+| `VideoSecurePT1` | yes | `0xC0000000` + `0x10000000` |
+| `VideoSecurePT2` | yes | `0xD0000000` + `0x10000000` |
+| `VideoSecurePT3` | yes | `0xE0000000` + `0x10000000` |
+| `VideoSecurePT4` | yes | `0xF0000000` + `0x10000000` |
+
+The same manifest settles a question the platform data raised: `iris`'s
+`tz_cp_config_sm8250` (`cp 0..0x25800000`, `cp_nonpixel 0x01000000..0x25800000`)
+and its `dma_mask = 0xe0000000 - 1` are **not** SM8250 leftovers - they match the
+vendor's sc8180x `virtual-addr-pool`s exactly (`venus_ns` `0x25800000 + 0xba800000`,
+`venus_sec_non_pixel` `0x1000000 + 0x24800000`, and 0xe0000000 is the top of the
+non-secure pool).  The platform data is right for this SoC.
+
+**What does not line up is where the UC region lands.**  That `dma_mask` bounds
+the IOVAs the IOMMU layer hands out, and the allocator fills from the top, so the
+region the firmware is told to use ends up at `0xdfc00000` - inside
+`VideoSecurePT2`'s half of the address space, and *outside* the non-secure
+window this machine's secure world was provisioned with.  Nothing on the CPU side
+notices, because the CPU does not go through the SMMU: Linux wrote the queue
+table there and read it back.  But a device access from the video's non-secure
+bank to an IOVA outside that bank's window is precisely the thing that cannot
+succeed - and "the firmware's first outbound access never completes" is the
+failure `-17` pinned down.
+
+That is testable without touching the code: `iris dma_mask_limit` is an exclusive
+upper bound for the video's IOVAs, and `0xC0000000` puts every one of them below
+the secure windows - inside both this board's non-secure window and the vendor's
+non-secure pool.
+
+`-18` ran that test.  The parameter did exactly what it was meant to:
+`dma_mask=0xbfffffff (platform 0xdfffffff, limit 0xc0000000)` and
+`ucregion: qtable=0xbfc00000 size=0x400000 sfr=0xbffff000` - the firmware's UC
+region moved from `0xdfc00000` (inside `VideoSecurePT2`'s half) to `0xbfc00000`
+(inside the non-secure window, and inside the vendor's non-secure pool as well).
+The run then died in exactly the same place as before, on
+`boot_fw: CTRL_INIT write`, with no new kernel message of any kind.
+
+So the placement is not the cause, and this is the useful shape of negative
+result: the intervention demonstrably changed the thing it was supposed to change
+- the log proves the address moved - so "the firmware was handed memory outside
+the window its bank is allowed" is eliminated rather than merely untested.
+
+###### Where the VPU bring-up ends (2026-10-05)
+
+Two independent firmware builds fail identically.  The 2022 driver's
+`VIDEO.IR.1.2-00042-PROD-1` (1159200 bytes, `md5 6909a826…`) goes through the
+same sequence - TZ authenticates it (`PAS auth ret=0`), the probe registers read
+back the same (`hw_version=0x5010002f`, `intr_mask=0x1e2`) - and dies on the same
+line, at/just after `boot_fw: CTRL_INIT write`.  The image is not the variable.
+
+What is established, in order:
+
+1. the block comes up correctly: in a live `no_auth` window VENUS_GDSC is
+   powered, the iris RCG is running, mvsc_core/mvs0_core/axi0/axi1 are enabled,
+   and the AHB2AXI bridge is out of reset;
+2. TZ authenticates the firmware and releases the core (`PAS auth ret=0`), and
+   the core executes it - the CTRL_INIT handshake comes back;
+3. with the core released and **no host register access at all**, the machine
+   dies about 10 ms after CTRL_INIT (`-17`);
+4. in every run the firmware never wrote to DDR: the message queue's write index
+   stayed 0 and the SFR stayed empty.
+
+So the application processor does everything it controls - power, clocks, a
+DDR-visible UC region, an authenticated image, a released core - the firmware
+starts, and then its first trip out to memory takes the interconnect down.  The
+SMMU translation and the XPU permissions on that path are the secure world's:
+the vendor's vidc node declares four context banks (one non-secure plus three
+secure; mainline declares one and trusts TZ for the rest), the wrapper's FW/CPA
+window is TZ-programmed, and the handover itself is what the Windows PIL driver
+does with its "share"/"unlock subsystem memory" TREE steps - for which mainline
+has no equivalent.  Nothing the driver writes changes any of that.
+
+That is where the non-secure road ends.  Every lever on this side of the fence
+has now been either verified working or tested and eliminated: power, clocks,
+resets and the UC region's placement all provably happen; the firmware image
+(two builds), the driver's register sequences, the doorbell, the interrupt path,
+the polling and the IOVA window are all ruled out.  The instrumentation stays in
+the tree behind debug module parameters
+(`hold_after_auth_ms`, `quiet_after_ctrl_init_ms`, `hold_after_ctrl_init_ms`,
+`dma_mask_limit`, `no_auth`, `fw_name`, `fw_phys`, `fw_size`), together with
+`tools/probe-vdec-run.sh`, `debug/videocc-peek.py` and the `vendor-ref/`
+extracts, as the record of how far this got and what ruled out what.
+
 ## Suspend / s2idle — WORKING (root cause: the power key was never enabled)
 
 Status: **working**, verified on hardware 2026-10-04.  Two s2idle cycles,

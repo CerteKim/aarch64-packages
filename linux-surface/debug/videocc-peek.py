@@ -236,6 +236,38 @@ def ahb_on():
           f"{'RUNNING' if (val & 1) and not (val & 2) else 'not running'}")
 
 
+def ahb_probe():
+    """Is 0x8f4 writable at all, or only its enable bit that refuses?
+
+    The live in-window dump shows every other clock and both power domains the
+    driver asks for coming up, and `0x8f4` reading 0 with a raw write of bit 0
+    not sticking - while its sibling `0x850` (mvsc_core, same BRIC page, same
+    BRANCH_VOTED type, enabled in the same run) does have bit 0 set.  So either
+    that one branch is gated/protected, or the whole register is read-only.
+
+    This writes only reserved or enable bits of 0x8f4 (never the FORCE_MEM_*
+    retention fields at bits 12-14, never the sleep/wakeup fields), plus one
+    control write whose *value actually changes*, to prove that non-secure
+    writes into this block do land.  (An earlier version of this probe wrote
+    back the value that was already in VENUS_GDSC, where bit 0 was already 0,
+    so its "write landed" proved nothing.)
+    """
+    c_before = read32(VIDEOCC, 0x8B4)          # VCODEC1_GDSC, collapsed: bit0=1
+    write32(VIDEOCC, 0x8B4, c_before & ~1)     # 1 -> 0, a real change
+    c_after = read32(VIDEOCC, 0x8B4)
+    write32(VIDEOCC, 0x8B4, c_before)          # restore
+    c_rest = read32(VIDEOCC, 0x8B4)
+    print(f"control VCODEC1_GDSC 0x8b4: 0x{c_before:08x} -> 0x{c_after:08x}  "
+          f"{'write landed' if (c_after & 1) == 0 else 'WRITE IGNORED'}, "
+          f"restored 0x{c_rest:08x}")
+
+    for val in (0x1, 0x2, 0x3, 0x10000):
+        before = read32(VIDEOCC, 0x8F4)
+        write32(VIDEOCC, 0x8F4, val)
+        after = read32(VIDEOCC, 0x8F4)
+        print(f"0x8f4 <- 0x{val:08x}: 0x{before:08x} -> 0x{after:08x}")
+
+
 def main():
     if os.geteuid() != 0:
         sys.exit("run me with sudo")
@@ -254,8 +286,10 @@ def main():
         powerup()
     elif cmd == "ahb-on":
         ahb_on()
+    elif cmd == "ahb-probe":
+        ahb_probe()
     else:
-        sys.exit(f"unknown command {cmd!r}: use dump, enable-ahb, release-interface, release-bric, gdsc-test, powerup or ahb-on")
+        sys.exit(f"unknown command {cmd!r}: use dump, enable-ahb, ahb-probe, release-interface, release-bric, gdsc-test, powerup or ahb-on")
 
 
 if __name__ == "__main__":
