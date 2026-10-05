@@ -2497,8 +2497,9 @@ unlock subsystem memory" steps are and why they cannot be reproduced from Linux:
   VTL0.  Implemented behind `pil0b_share` (via a project-local
   `qcom_scm_debug_call()`, since mainline has no wrapper) and tried at the safe
   `stop_before_boot` checkpoint - core released, never kicked - TrustZone answers
-  **-EIO** for the `(address, size, pas_id, HLOS)` reading.  It returns rather
-  than hangs, but it refuses.
+  **-EIO** for the `(address, size, pas_id, HLOS)` reading and **-EIO** again for
+  the `(addr_lo, addr_hi, pas_id, HLOS)` one.  It returns rather than hangs, but
+  it refuses both.
 
 So the wall is specific: the step the Venus firmware needs before it can touch
 DDR is an assign/XPU operation that on this machine is performed by a **Windows
