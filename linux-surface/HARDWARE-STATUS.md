@@ -61,30 +61,82 @@ the kernel then leaves the controller `HCI_UNCONFIGURED`:
 it work, but only until the next power cycle (the address is not persistent),
 so it has to be repeated after every boot.
 
-The device tree now provides the address, and the kernel programs it into the
-chip during setup (`qca_set_bdaddr`) before bluetoothd starts:
+The device tree provides the address, and the kernel programs it into the chip
+during every setup (`qca_set_bdaddr`) before bluetoothd starts:
 
 ```
-local-bd-address = [55 44 33 22 11 00];	/* 00:11:22:33:44:55 */
+local-bd-address = [60 ad ce 9e 16 14];	/* 14:16:9E:CE:AD:60 */
 ```
 
 `local-bd-address` is little-endian, per
-`Documentation/devicetree/bindings/net/bluetooth/bluetooth-controller.yaml`,
-so the property above is the address `00:11:22:33:44:55`.
+`Documentation/devicetree/bindings/net/bluetooth/bluetooth-controller.yaml`.
 `qcom,local-bd-address-broken` is *not* needed here (that flag is for boot
 firmware that passes the value big-endian). The value is synthetic and per
-board — there is no stored address anywhere on this machine to recover — and
-it is shared by every user of this DTB.
+board — there is no stored address anywhere on this machine to recover — so it
+is shared by every user of this DTB. It does not have the locally-administered
+bit set (the first octet's low nibble should be 2, 6, a or e); worth fixing if
+this DTB is ever copied to another machine, but this is what the machine has
+been using.
 
-Deploying it is the usual DTB swap plus a reboot:
+The property lives in `arch/arm64/boot/dts/qcom/sc8180x-xiaomi-book-12.4.dtsi`,
+so every DTB built from the tree carries it. Deploying a change is:
 
 ```
-sudo ./set-panel-link-mode.sh single    # or: dual
-sudo reboot
+make -C src/kernel ARCH=arm64 qcom/sc8180x-xiaomi-book-12.4.dtb
+sudo bash tools/install-dtb-from-tree.sh     # parked DTB into both GRUB paths,
+sudo reboot                                  # probe variant refreshed next to it
 ```
 
-Both `panel-dtb/sc8180x-xiaomi-book-12.4.{single,dual}-link.dtb` carry the
-property, so the address survives switching panel link modes.
+`tools/install-dtb-from-tree.sh` keeps the booted paths on the parked (VPU
+disabled) variant; `tools/update-probe-dtb.sh` is the one that flips them to
+the probe variant.
+
+Verified on hardware after that rebuild (2026-10-05):
+
+```
+$ od -An -tx1 /sys/firmware/devicetree/base/soc@0/geniqup@cc0000/serial@c8c000/bluetooth/local-bd-address
+ 60 ad ce 9e 16 14
+$ hciconfig hci0
+hci0:	Type: Primary  Bus: UART
+	BD Address: 14:16:9E:CE:AD:60  ACL MTU: 1024:7  SCO MTU: 240:4
+	UP RUNNING PSCAN ISCAN
+$ bluetoothctl list
+Controller 14:16:9E:CE:AD:60 archlinux [default]
+```
+
+#### History: why Bluetooth disappeared on 2026-10-05
+
+The property used to exist only in the prebuilt
+`panel-dtb/sc8180x-xiaomi-book-12.4.{single,dual}-link.dtb` snapshots, never in
+the DTSI. When the DTBs in `/boot/dtb/linux-mibook/qcom/` were rebuilt from the
+tree on 2026-10-04, the property went with them: `hci0` came back `DOWN RAW` on
+the placeholder `39:90:21:64:07:00`, absent from the mgmt index list, and
+`bluetoothctl list` / `btmgmt info` / the GNOME panel showed no adapter at all.
+
+`bluetooth-bdaddr.service` (see `systemd/`) was meant to cover exactly that gap,
+and it never worked, for two reasons:
+
+* it waited only for `/sys/class/bluetooth/hci0`, which appears well before the
+  controller leaves `HCI_SETUP`/`HCI_CONFIG`. `MGMT_OP_SET_PUBLIC_ADDRESS`
+  during that window is answered with `0x11 (Invalid Index)` — the journal
+  shows exactly that at every boot;
+* it used `btmgmt --timeout`, whose result is invisible. With a timeout set,
+  `bt_shell_noninteractive_quit()` (BlueZ `src/shared/shell.c`) returns early
+  and the process exits 0 when the timer fires, whatever the command answered.
+  The `hci0 address set to 14:16:9E:CE:AD:60` line was therefore a false
+  positive, and the "is it already set" check read
+  `/sys/class/bluetooth/hci0/address`, an attribute this kernel does not have
+  (`net/bluetooth/hci_sysfs.c` only exposes `reset`).
+
+The fix is the DTSI property above. The unit stays in the repo as a fallback for
+DTBs that lack the property — it now retries until the controller is
+configurable, reads the address back with `hciconfig`, treats `HCI_RAW` being
+clear as success, and a udev rule re-runs it if the controller is re-registered
+— but it should not be installed on a machine whose DTB carries the address:
+
+```
+sudo bash tools/install-bluetooth-bdaddr.sh --uninstall
+```
 
 ### Audio (WCD9340 + WSA881x) — WORKING
 
