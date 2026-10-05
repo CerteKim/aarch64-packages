@@ -2463,6 +2463,50 @@ result: the intervention demonstrably changed the thing it was supposed to chang
 - the log proves the address moved - so "the firmware was handed memory outside
 the window its bank is allowed" is eliminated rather than merely untested.
 
+###### The VTL1 wall: what the Windows reverse engineering settled
+
+Reverse engineering the four Windows drivers plus `QcSkExt8180.exe` (extracted
+from the qcpil driver package on the Windows partition) settled what the "share /
+unlock subsystem memory" steps are and why they cannot be reproduced from Linux:
+
+* They are all **SIP/PIL SCM calls**, in a wire format bit-identical to
+  mainline's `struct qcom_scm_desc` - `{u32 (owner<<24|svc<<8|cmd), u32 arginfo,
+  u64 args[]}`.  qcpil's sequence is PIL/5 auth, **PIL/6 "unlock subsystem
+  memory"**, PIL/1 init_image, PIL/2 mem_setup, MP/0x16 assign_mem, **PIL/0xb
+  "share subsystem memory"**.  mainline has wrappers for all of them except
+  PIL/6 (which it *names* `pas_shutdown`) and PIL/0xb.
+* **PIL/6 cannot be issued from here.**  Called before init_image - the position
+  Windows uses - the SMC never returns: the calling thread parks in it, the GPU's
+  TZ traffic starves (`msm_dpu: hangcheck detected gpu lockup`) and the display
+  freezes until a hard power cycle.  Windows sends it only behind a guard
+  (`obj[0x110] == 1`, cleared afterwards), so mainline's naming looks like the
+  accurate one.
+* **MP/0x16 is VTL1-mediated on this machine.**  `QcSkExt8180.exe` is not a
+  user-mode client but the Windows **VTL1 "SK extension" trustlet** (installed
+  via `PlatformExecute`, imports only `IumSdk.dll`, assigns through
+  `AssignMemoryToSocDomain`).  It *intercepts* `0x02000c16` and re-emits it to
+  the real TrustZone in its own argument form (`pSrcVMList` + a 4 KB
+  indirect-params block), which is not the flat six-argument form qcpil sends
+  from VTL0 and `qcom_scm_assign_mem()` sends.  That is why every assign from
+  Linux returns `-EINVAL`: four CP_* VMIDs (0x8/0xa/0xb/0xd), qcpil's own two
+  hardcoded selector tuples, the trustlet's video sequence
+  (`HLOS -> 0x0e -> 0x0c -> HLOS`) and a control all failed, both before and
+  after `mem_protect_video_var()`.
+* **PIL/0xb is the one call the trustlet does not intercept** (no case for
+  `0x0200020b` in its dispatch table), so it does reach the real TrustZone from
+  VTL0.  Implemented behind `pil0b_share` (via a project-local
+  `qcom_scm_debug_call()`, since mainline has no wrapper) and tried at the safe
+  `stop_before_boot` checkpoint - core released, never kicked - TrustZone answers
+  **-EIO** for the `(address, size, pas_id, HLOS)` reading.  It returns rather
+  than hangs, but it refuses.
+
+So the wall is specific: the step the Venus firmware needs before it can touch
+DDR is an assign/XPU operation that on this machine is performed by a **Windows
+VTL1 component**, which Linux cannot instantiate.  What VTL0 *can* reach is the
+QSEE app interface - `qcom_scm_qseecom_app_get_id("qcom.tz.winsecapp")` answers
+app_id 3 on this TZ, with `qcom.tz.uefisecapp` as a working control - and the
+un-intercepted PIL/0xb, and neither of those is the missing assign.
+
 ###### Where the VPU bring-up ends (2026-10-05)
 
 Two independent firmware builds fail identically.  The 2022 driver's
