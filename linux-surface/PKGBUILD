@@ -13,17 +13,25 @@ arch=("aarch64")
 options=("!strip")
 makedepends=('xmlto' 'docbook-xsl' 'kmod' 'inetutils' 'bc' 'git' 'dtc')
 
-# e7f42460 is the tip of xiaomi-mainline-panel2 (also on GitHub): the Xiaomi
+# 07050c50 is the tip of xiaomi-mainline-panel2 (also on GitHub): the Xiaomi
 # Book 12.4 board description is a single .dts again (the "-oc" variant is
 # gone), the RA9530 stylus charger and the WCN3998 BD address are described,
 # and the branch carries the audio fixes (WSA881x "PA Volume" kept across DAPM
 # power-up, WCD934x RX volumes capped at 0 dB, S16_LE playback front ends) plus
 # the LPG-PWM backlight, power/volume keys and the higher GPU DVFS states.
 #
+# On top of that it hardens the WCD9340's SoundWire master: the AHB
+# address/data pair is serialised, a failed register read no longer injects
+# garbage into the slave status array (the spurious "Slave N state check1:
+# UNATTACHED" cycles), the command FIFO checks fail closed, a read that is
+# given up on leaves the read FIFO empty, transfers are retried, and the IRQ
+# handler's status loop is bounded.  A command error also reports the frame
+# generator state, which is what separates a stray command from a dead link.
+#
 # pkgrel is deliberately left at 1: bumping it would change the release string
 # from 6.18.2-1-mibook+ and invalidate the modules already built against the
 # installed kernel.
-_ref_ksource="e7f42460ff28bf7dea1052609c287da6616f2938"
+_ref_ksource="07050c5050af46024e7fa1777938df51388a662a"
 _ref_config_base="e36ada85974d22c05d1442a4ac47f958c7fa8e15"
 
 # The branch with the mainline panel driver is not pushed to GitHub yet, so the
