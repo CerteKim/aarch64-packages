@@ -37,7 +37,7 @@ for f in vmlinuz-linux-mibook; do
     [ -f "$FALLBACK/$f.single-dsi" ] || cp -a "/boot/$f" "$FALLBACK/$f.single-dsi"
     echo "    saved $f"
 done
-for f in "$DTB" "sc8180x-xiaomi-book-12.4-oc.dtb"; do
+for f in "$DTB"; do
     [ -f "$BOOT_DTB_DIR/$f" ] || continue
     [ -f "$FALLBACK/$f.single-dsi" ] || cp -a "$BOOT_DTB_DIR/$f" "$FALLBACK/$f.single-dsi"
     echo "    saved $f"
