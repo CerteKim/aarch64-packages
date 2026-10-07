@@ -13,17 +13,17 @@ arch=("aarch64")
 options=("!strip")
 makedepends=('xmlto' 'docbook-xsl' 'kmod' 'inetutils' 'bc' 'git' 'dtc')
 
-# 430e0db is the tip of xiaomi-mainline-panel2 in the local mirror: on top of
-# 5788790 (LPG-PWM backlight, power key, volume keys, higher GPU DVFS states)
-# it keeps the user's WSA881x "PA Volume" across DAPM power-up, drops the
-# S24_LE speaker-backend quirk that was costing 20-48 dB, and (now that the
-# level is right) caps the WCD934x RX digital volumes at 0 dB, and narrows the
-# playback front ends to S16_LE (an S24_LE front end is 20-48 dB down).
+# e7f42460 is the tip of xiaomi-mainline-panel2 (also on GitHub): the Xiaomi
+# Book 12.4 board description is a single .dts again (the "-oc" variant is
+# gone), the RA9530 stylus charger and the WCN3998 BD address are described,
+# and the branch carries the audio fixes (WSA881x "PA Volume" kept across DAPM
+# power-up, WCD934x RX volumes capped at 0 dB, S16_LE playback front ends) plus
+# the LPG-PWM backlight, power/volume keys and the higher GPU DVFS states.
 #
 # pkgrel is deliberately left at 1: bumping it would change the release string
 # from 6.18.2-1-mibook+ and invalidate the modules already built against the
 # installed kernel.
-_ref_ksource="430e0dbdb5086be878e2ed4eddf45a1fe46bbc1b"
+_ref_ksource="e7f42460ff28bf7dea1052609c287da6616f2938"
 _ref_config_base="e36ada85974d22c05d1442a4ac47f958c7fa8e15"
 
 # The branch with the mainline panel driver is not pushed to GitHub yet, so the
@@ -113,13 +113,7 @@ _package() {
     done
     mkdir -p "${pkgdir}/boot/dtb/${pkgbase}" && cp -r "${modulesdir}/dtb/." "${pkgdir}/boot/dtb/${pkgbase}/"
 
-    # The stock device tree goes to every GRUB-referenced name: the default
-    # menu entry boots "-oc.dtb" and the Advanced entry the plain name.  They
-    # are the same tree — the higher GPU states of this part live in
-    # sc8180x-xiaomi-book-12.4.dtsi now, not in a separate variant.
     local qdir="${pkgdir}/boot/dtb/${pkgbase}/qcom"
-    install -Dm644 "${qdir}/sc8180x-xiaomi-book-12.4.dtb" \
-        "${qdir}/sc8180x-xiaomi-book-12.4-oc.dtb"
 
     # Probe variant for the video work: same tree, VPU node enabled.  Nothing
     # references it until tools/probe-vdec-run.sh installs it.
@@ -154,6 +148,18 @@ _package-headers() {
     install -Dt "${builddir}/kernel" -m644 "kernel/Makefile"
     install -Dt "${builddir}/arch/arm64" -m644 "arch/arm64/Makefile"
     cp -t "${builddir}" -a "scripts"
+
+    # CONFIG_DEBUG_INFO_BTF_MODULES=y makes scripts/Makefile.modfinal run
+    # $(objtree)/tools/bpf/resolve_btfids/resolve_btfids on every external .ko.
+    # That host tool is built during the kernel build but lives outside the
+    # directories copied above, so without it the DKMS build compiles the
+    # module and then dies with
+    #   /.../build/tools/bpf/resolve_btfids/resolve_btfids: No such file or directory
+    # (exit 127, "Bad return status for module build").  Ship it like Arch does.
+    if grep -q '^CONFIG_DEBUG_INFO_BTF_MODULES=y' .config; then
+        install -Dt "${builddir}/tools/bpf/resolve_btfids" -m755 \
+            "tools/bpf/resolve_btfids/resolve_btfids"
+    fi
 
     # add xfs and shmem for aufs building
     mkdir -p "${builddir}"/{fs/xfs,mm}
