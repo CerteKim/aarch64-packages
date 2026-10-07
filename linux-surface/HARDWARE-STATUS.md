@@ -2943,6 +2943,48 @@ never power-cycling the amplifier. `tools/install-amp-variant.sh` switches
 between the three variants, and the default install uses the *stock* driver on
 purpose.
 
+### The prebuilt variants are per-kernel objects (2026-10-07)
+
+`tools/orig-snd-soc-wsa881x.ko` and `tools/h1a-snd-soc-wsa881x.ko` are binaries,
+and a kernel module is only valid for the kernel build it was generated
+against: the loader validates the module's BTF against the **running** kernel's
+table (`/sys/kernel/btf/vmlinux`). A stale `.ko` keeps a matching `vermagic`
+and `modinfo`, so nothing looks wrong at install time — and then the kernel
+says
+
+```
+failed to validate module [snd_soc_wsa881x] BTF: -22
+```
+
+The module never loads, both WSA881x components are missing, `snd_soc_sdm845`
+cannot build the card, and the machine boots with **no sound card at all**
+(`--- no soundcards ---`, `alsamixer: cannot find card '0'`). This is not the
+amplifier race above and not a SoundWire fault: nothing was misconfigured, the
+codec never got a chance to register.
+
+It happened on 2026-10-07: `tools/audio-fix-install.sh` installed the 10-05
+prebuilts, and the running kernel was #35, rebuilt in between with
+`sched_ext` / `uclamp` / `DEBUG_INFO_BTF` config changes that moved the vmlinux
+BTF. The fix is to *rebuild* the variants for the running kernel:
+
+```
+tools/build-amp-variant.sh          # normal user, not sudo
+sudo tools/install-amp-variant.sh orig
+```
+
+`build-amp-variant.sh` rebuilds both variants from the tree (reverting
+`cecbd35ca830` for `orig`, dropping the `SD_N` assert for `h1a`), strips debug
+info while keeping `.BTF`, restores the tree's own `gain` build, and writes
+`tools/.amp-variant-btf` — the hash of `/sys/kernel/btf/vmlinux` at build time.
+`install-amp-variant.sh` refuses to install `orig`/`h1a` when that hash no
+longer matches the running kernel (`AMP_VARIANT_FORCE=1` overrides), so this
+failure mode cannot come back silently. `gain` comes from the tree build and is
+never checked because it is always in step with it.
+
+Verification: the tree's `vmlinux` `.BTF` section and the running kernel's
+`/sys/kernel/btf/vmlinux` hash the same (`761c4fc4…` on this boot), which is
+what makes a freshly built variant trustworthy without rebooting to test it.
+
 ### Correction: an earlier revision of this file got this backwards
 
 It previously claimed `124` was "squared off" overdrive, that "84 was already

@@ -4,3 +4,6 @@ kernel/
 surface.config
 *.pkg.tar.zst
 *.pkg.tar.xz
+
+# amplifier variant build stamp (per-kernel BTF)
+tools/.amp-variant-btf

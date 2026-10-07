@@ -64,8 +64,18 @@ case "$kernver" in
 esac
 
 echo "== installing modules =="
-install -Dm644 "${here}/tools/orig-snd-soc-wsa881x.ko" \
-	"${moddir}/codecs/snd-soc-wsa881x.ko"
+# Through install-amp-variant.sh on purpose: it checks that the prebuilt
+# wsa881x module matches the running kernel's BTF.  A stale .ko is rejected at
+# load time ("failed to validate module [...] BTF: -22") and takes the whole
+# sound card with it, which is exactly what happened on 2026-10-07.
+if ! "${here}/tools/install-amp-variant.sh" orig; then
+	echo >&2
+	echo "refusing to continue: the wsa881x module was not installed, and booting" >&2
+	echo "with a mismatched one means no sound card at all.  Rebuild the variants" >&2
+	echo "for this kernel, then re-run this script:" >&2
+	echo "    tools/build-amp-variant.sh        # normal user, not sudo" >&2
+	exit 1
+fi
 install -Dm644 "${here}/src/kernel/sound/soc/qcom/snd-soc-sdm845.ko" \
 	"${moddir}/qcom/snd-soc-sdm845.ko"
 depmod -a "${kernver}"
