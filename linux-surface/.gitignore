@@ -7,3 +7,6 @@ surface.config
 
 # amplifier variant build stamp (per-kernel BTF)
 tools/.amp-variant-btf
+
+# build artifact of tools/dwt/dwt-probe.c
+tools/dwt/dwt-probe

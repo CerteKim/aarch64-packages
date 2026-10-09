@@ -2710,6 +2710,13 @@ pressed, flip `GPIO_ACTIVE_LOW` (or the bias).
 
 ## GPU DVFS: the higher states this part advertises — WORKING
 
+> **7.2 status**: the table below is what patch 0023 puts into the 7.2 DTS, and it
+> fixes a real downclocking bug.  However, on 7.2 the GPU still *wedges* silently
+> a minute into a GNOME session (the GMU stops answering HFI), which is unrelated
+> to frequency or voltage.  The full investigation, everything ruled out, and the
+> remaining bisect plan are in **[linux-7.2-gpu-wedge.md](linux-7.2-gpu-wedge.md)**.
+> Keep using 6.18 as the daily driver for now.
+
 The part on this board is binned above the profile `sc8180x.dtsi` describes: the
 DSDT carries several GPU DVFS sets, and the stock table Linux uses is the
 slowest of them.  They are all `"ENGINE_PSTATE_SET" 0x02` /
@@ -2725,14 +2732,19 @@ each PSTATE giving the core clock, a GPU percentage and the RPMh corner:
 Windows on this machine reports 670 MHz as the GPU maximum, i.e. it runs the
 670 MHz profile.
 
-Validated by building the same tree with the extra frequencies appended and
-running it: adding the states to the OPP table is all it takes for the GPU to
-use them, which is what the mechanism below predicts.  The three added levels
-also need no new RPMh arc — each one is already used by a stock state
-(`NOM`/`NOM_L1`/`TURBO_L1` back 405/461/514 MHz), so the `gfx.lvl` lookup that
-`a6xx_gmu_rpmh_arc_votes_init()` performs cannot fail on them.
+**Replaced, not appended.**  An earlier version of this file kept the stock
+table and appended only 530/595/670 MHz on top.  That leaves *two clocks on one
+RPMh corner* (405 and 530 both at `NOM`, 461 and 595 both at `NOM_L1`, 514 and
+670 both at `TURBO_L1`) — and since the table below is keyed by the corner, the
+firmware then runs the lower of the two, which is exactly the downclocking this
+section fixes.  The stock nodes are therefore deleted and the binned set
+declared in their place.
 
-### Why declaring the states is enough
+All seven corners of the binned profile are already used by the stock states
+(`LOW_SVS`..`TURBO_L1`), so the `gfx.lvl` lookups that
+`a6xx_gmu_rpmh_arc_votes_init()` performs cannot fail on any of them.
+
+### Why the OPP table is all that matters
 
 The a6xx driver does not read its DVFS levels from the firmware — it *sends* its
 whole OPP table to the GMU over HFI:
@@ -2743,33 +2755,34 @@ whole OPP table to the GMU over HFI:
 and each level's GX rail vote comes from the OPP's `opp-level`
 (`a6xx_gmu_rpmh_arc_votes_init()` -> `a6xx_gmu_get_arc_level()` ->
 `dev_pm_opp_get_level()`), matched against the RPMh `gfx.lvl` command-db list.
-So an extra OPP carrying the vendor's own corner fully describes a new firmware
-DVFS level; nothing else needs to change.
+The firmware's DVFS is therefore driven by the *corner*, one entry per corner —
+which is why a stock state left in at a binned state's corner hijacks it.
 
 ### What is in the tree
 
-The board content lives in `sc8180x-xiaomi-book-12.4.dtsi`, which now carries
-the three extra states itself — there is no separate variant any more:
+The board content lives in `sc8180x-xiaomi-book-12.4.dts` (one file; the `-oc`
+variant is long gone).  It `/delete-node/`s the seven stock OPPs and declares
+the binned profile instead:
 
 | state | `opp-level` |
 | --- | --- |
+| 235 MHz | `RPMH_REGULATOR_LEVEL_LOW_SVS` (`0x40`) |
+| 315 MHz | `RPMH_REGULATOR_LEVEL_SVS` (`0x80`) |
+| 392 MHz | `RPMH_REGULATOR_LEVEL_SVS_L1` (`0xc0`) |
 | 530 MHz | `RPMH_REGULATOR_LEVEL_NOM` (`0x100`) |
 | 595 MHz | `RPMH_REGULATOR_LEVEL_NOM_L1` (`0x140`) |
+| 625 MHz | `RPMH_REGULATOR_LEVEL_TURBO` (`0x180`) |
 | 670 MHz | `RPMH_REGULATOR_LEVEL_TURBO_L1` (`0x1a0`) |
 
-625 MHz (`TURBO`) and 718 MHz (`TURBO_L2`) are deliberately left out.  Folding
-them into the board file produced a DTB byte-identical to the earlier
-`-oc` variant build, so this is exactly the same device tree the default entry
-used to boot.
+718 MHz (the `TURBO_L2` profile) is deliberately left out — Windows runs the
+670 MHz profile on this machine.
 
-`sc8180x-xiaomi-book-12.4.dts` is a thin wrapper for it, and the package installs
-that one DTB under every name GRUB references —
-`sc8180x-xiaomi-book-12.4.dtb` (Advanced / SD-card entries) and
-`sc8180x-xiaomi-book-12.4-oc.dtb` (the default entry), plus a
-`-vdec-probe.dtb` copy with the VPU node enabled for the video work.  So
-whatever entry is picked, the GPU gets the full set; `set-panel-link-mode.sh`
-and `install-mainline-panel.sh` still only write the stock path because their
-prebuilt panel DTBs predate all of this.
+There are two device-tree trees to keep in step, because GRUB points each set of
+entries at its own copy: `sc8180x-xiaomi-book-12.4.dtb` under
+`/boot/dtb/linux-mibook/qcom/` serves the `linux-mibook` (6.18) entries and
+`/boot/dtb/linux-mibook-mainline/qcom/` serves the mainline 7.2 entries.
+Nothing else in the tree changes: the GPU node keeps its phandle, the GMU OPP
+table is untouched, and the board's ICC/CPU tables are unaffected.
 
 ### Speed bin or profile?
 
