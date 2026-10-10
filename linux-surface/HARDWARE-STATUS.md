@@ -19,6 +19,7 @@ Board: `xiaomi,book-12.4` / `TM2133`, BIOS `XM28C2B0P16`, Qualcomm SC8180X
 | Thermal | `qcom-tsens` (2), `qcom-lmh`, 14 thermal zones |
 | RTC / lid / power key | `rtc-pm8xxx`, gpio-keys (tlmm 121) |
 | Remoteprocs | ADSP, CDSP, MPSS, SLPI all running |
+| Microphones | **Built-in array works** (WCD9340 DMIC0+DMIC1, both answer, DMIC1 louder): `arecord -D hw:0,1 -c 2` follows speech (ambient 32k -> speech 93k, DC ~0). The stream is S24_LE **stereo** and mono is a mis-description -- the UCM's CaptureChannels must be 2, which is why PipeWire capture was white noise. `corr(ch0,ch1)=+1.000`, so it is a single-channel array; DEC1/SLIM TX1 carries nothing. UCM: SectionDevice."InternalMic" (`tools/install-ucm.sh`). See [microphone-plan.md](microphone-plan.md) §6.2 |
 | Sensors | SSC via SLPI + hexagonrpcd (started by `hexagonrpcd-sdsp.path`): accelerometer `icm4x6xx`, ALS + proximity `stk3a5x`. Readings work; GNOME auto-rotation needs the inhibit recipe at login until mutter#4931 is fixed |
 
 ## Fixed in the `xiaomi-bringup` branch
@@ -248,40 +249,101 @@ Everything downstream of the codec was already succeeding.
 `wcd934x` and `wsa881x` sequences plus the sc8180x-mainline sm8150 profile,
 so a proper UCM profile can be assembled from them later.
 
-## Microphones — there are none on the codec
+## Microphones — array is on the codec; capture still silent (open, 2026-10-10)
 
-Capture works end to end (codec ADC → SLIM TX → ADSP ADM → MultiMedia2 →
-ALSA): tying off `AIF1_CAP Mixer SLIM TX0` collapses the stream to the DSP
-idle pattern, so the data really does come from the codec. But nothing that
-reaches the WCD9340's ADC responds to sound.
+> **Status: the two built-in microphones (either side of the camera) are on the
+> WCD9340's DMIC pins, but our capture does not yet work.** This section went
+> through two wrong answers before that — "there are none on the codec" (the
+> board plainly has them) and then "they are not on the codec" (the codec path
+> was fully powered and still silent). The Windows-partition evidence that
+> settled the direction is in [microphone-plan.md](microphone-plan.md) §6.1;
+> the register-level measurements are in §5.1.
+
+The two internal microphones are digital MEMS parts. ACPI exposes the codec
+(and nothing else) as the audio path — `SLM1` / `ADCM` / `AUDD` in the DSDT,
+with no LPASS TX/VA macro device anywhere — and the SC8180X (`sdmshrike`)
+vendor device tree wires `DMIC0/1 → MIC BIAS1`, `DMIC2/3 → MIC BIAS3` and
+`DMIC4/5 → MIC BIAS4` on this codec, with a 4.8 MHz
+`qcom,cdc-dmic-sample-rate`.
+
+Capture works end to end (codec ADC → SLIM TX → ADSP ADM → MultiMedia2 → ALSA):
+tying off `AIF1_CAP Mixer SLIM TX0` collapses the stream to the DSP idle
+pattern, so the data really does come from the codec.
 
 Measured with the speaker muted, a quiet baseline followed by tapping on the
 tablet and talking (`./xiaomi-book-12.4-mic-tap-test.sh`, "lift" = loud-window
 mean over the loudest quiet window):
 
-| Input | lift |
-|---|---|
-| AMIC1 (ADC1) | 0.96x |
-| AMIC2 (ADC2) | 0.98x |
-| AMIC3 (ADC3) | 1.25x |
-| AMIC4 (ADC4) | 0.81x |
-| DMIC0…DMIC5 | no data at all |
+| Input | lift | reading |
+|---|---|---|
+| AMIC1 (ADC1) | 0.96x | flat — analogue input, not the array |
+| AMIC2 (ADC2) | 0.98x | flat — this is the headset-mic input, has its bias route |
+| AMIC3 (ADC3) | 1.25x | flat |
+| AMIC4 (ADC4) | 0.81x | flat |
+| DMIC0…DMIC5 | no data at all | **invalid measurement** — no bias route existed, see below |
 
-That matches the hardware. Xiaomi's own spec sheet lists the audio as
-"Dual speakers, 3.5mm headphone jack" and no microphone anywhere; `arecord -l`
-shows the WCD9340 capture PCM as the only capture device on the system, and
-the keyboard cover is a plain composite device with no USB audio. The codec
-does register a `Headset Mic Jack` / `Headset Mic Switch`, and the machine
-driver has jack pins for `Headset Mic`, so the only microphone on this
-machine is the one on the 3.5 mm headset.
+The AMIC rows are real: the array is not on the analogue inputs, and
+`AMIC2`/`MIC BIAS2` (inherited from the Yoga C630) is the headset microphone and
+is correct as it stands.
 
-Consequence: the `AMIC2`/`MIC BIAS2` routing inherited from the Yoga C630 is
-the headset-mic wiring and is probably right as it stands. Capture should
-work with a headset that has a microphone plugged in; there is no built-in
-microphone to fix.
+The DMIC rows were **not** evidence that the pins are unused. The codec driver
+has no `DMICn → MIC BIASx` routes of its own; they must come from the machine's
+`audio-routing`, and at the time of that sweep the sound node declared only
+`"AMIC2", "MIC BIAS2"`. Without the routes ASoC's DAPM never powers the bias
+rail (a digital mic with no bias is dead) and never runs
+`wcd934x_codec_enable_dmic()`, so the codec's PDM clock is off as well — which
+is precisely a capture of "no data at all". The routes were then added
+(`"DMICn", "MIC BIASx"` and `"DMICn", "MCLK"` for all three pairs) and the DTB
+rebuilt, which is what made the measured run below possible.
+
+### The run that settled it (register-verified, 2026-10-10)
+
+`tools/mic-dmic-probe.sh` (2 kHz tone, sink muted for the baseline so playback
+crosstalk cannot fake a response) plus `tools/mic-regs.sh` with an instrumented
+codec module (`build/mic-diag/`) reading the codec **while capturing**:
+
+| what was checked | register / log | value during capture |
+|---|---|---|
+| MIC BIAS rail on, 1800 mV | `ANA_MICB1` / `ANA_MICB3` | `0x50` / `0x65` ✔ |
+| PDM clock actually running | `CPE_SS_DMIC0_CTL`/`1_CTL` bit 0 | `0x05` ✔ |
+| TX0 switched to its DMIC source | `TX0_PATH_CFG0` bit 7 | `0xd0` ✔ |
+| ADC MUX0 on the right input | `INP_MUX_ADC0_CFG0/1` | `0x09`/`0x00`, `0x19`/`0x00` ✔ |
+| driver's rate/divider decision | `XIAOMI-AUDIO: DMIC0 on … fs=2400000 val=0x2` | 4.8 MHz PDM ✔ |
+| acoustic response | captured PCM | **silence on both pairs** ✘ |
+
+So every part of the codec's digital-mic path was demonstrably powered and
+routed, and the captures still did not respond to sound.
+
+**Correction (same day, from the Windows partition): the array *is* on this
+codec.** `/mnt/win` enumerates it as "Internal Microphone Array - Front" on the
+`ADSP/SLM1/ADCM/AUDD` node, and `Codec_cal.acdb` in the Qualcomm ACDB package
+contains a **Wideband DMIC** calibration block — uniquely in the codec file,
+and only for a codec with digital microphones wired to it. So the register table
+above is *necessary but not sufficient*: the codec and the wiring are right, and
+what is missing is something the Windows/ADSP path does (an enable, a port
+setup, or the DMIC pad drive strength) rather than a dead pin. Do **not** read
+this section as "the array is elsewhere" — that was this document's third wrong
+answer in a row and it is withdrawn. Full evidence and the next experiments:
+[microphone-plan.md](microphone-plan.md) §6.1.
 
 ### Traps found while chasing this
 
+* **One bad `audio-routing` entry unregisters the whole card.** A route whose
+  source or sink is not an existing DAPM widget makes
+  `snd_soc_register_card()` abort, and the machine then has *no* sound card at
+  all — speakers included — not merely a broken mic. Do not copy the vendor
+  (sdmshrike) DT's `"MIC BIASx", "Digital Mic n"` lines: `Digital Mic0..5` are
+  widgets of Qualcomm's downstream machine driver and do not exist in mainline
+  (`ASoC: Failed to add route Digital Mic0(*) -> MIC BIAS1`, then
+  `/proc/asound/cards` = "no soundcards"). After any `audio-routing` edit, boot
+  and check `dmesg | grep ASoC` plus `/proc/asound/cards` first.
+* **A missing `audio-routing` line means a dead input, not an unused pin.**
+  DAPM only powers microphone bias and the codec PDM clock through routes
+  declared in the sound node; the codec driver deliberately has none. Never
+  read "no data" as "no hardware" until the route exists.
+* **`arecord -l` cannot show built-in codec mics.** They are inputs of the
+  WCD9340, not separate devices, so their absence from the device list says
+  nothing about whether the hardware is present.
 * **Speaker-pulse tests are useless on this machine.** Electrical crosstalk
   out of the playback path makes AMIC1, AMIC2 and AMIC3 all "respond" to a
   tone. Mute the speaker and use a real acoustic source instead.
